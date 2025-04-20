@@ -1,0 +1,18 @@
+from aiogram import Bot, Dispatcher, executor, types
+
+bot = Bot(token="{{ project.token }}")
+dp = Dispatcher(bot)
+
+@dp.message_handler(commands=['start'])
+async def start(message: types.Message):
+    await message.answer("Пожалуйста, отправьте заказ в формате:\nФИО, товар, адрес")
+
+@dp.message_handler()
+async def process_order(message: types.Message):
+    # Эмуляция сохранения заявки
+    with open("orders.txt", "a", encoding="utf-8") as f:
+        f.write(f"{message.from_user.id}: {message.text}\n")
+    await message.answer("Спасибо! Ваш заказ принят.")
+
+if __name__ == '__main__':
+    executor.start_polling(dp)
