@@ -1,15 +1,86 @@
 from aiogram import Bot, Dispatcher, executor, types
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
 
 bot = Bot(token="{{ project.token }}")
-dp = Dispatcher(bot)
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
 
 questions = {{ project.content.questions }}
+start_message = {{ project.content.start_message }}
+
+class QuizState(StatesGroup):
+    question_id = State()
+
+questions_dict = {q["id"]: q for q in questions}
 
 @dp.message_handler(commands=['start'])
-async def start(message: types.Message):
-    for q in questions:
-        options = "\n".join(f"{i+1}. {opt}" for i, opt in enumerate(q["options"]))
-        await message.answer(f'{q["question"]}\n{options}')
+async def start_quiz(message: types.Message, state: FSMContext):
+    # Отправляем стартовое сообщение
+    if "photo" in start_message:
+        await message.answer_photo(start_message["photo"], caption=start_message["text"])
+    elif "gif" in start_message:
+        await message.answer_animation(start_message["gif"], caption=start_message["text"])
+    else:
+        await message.answer(start_message["text"])
+
+    # Начинаем с первого вопроса
+    first_question = questions[0]
+    await send_question(message.chat.id, first_question, state)
+
+async def send_question(user_id, question, state: FSMContext):
+    text = question["text"]
+    options = question.get("options", [])
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for opt in options:
+        markup.add(opt)
+
+    if "photo" in question:
+        await bot.send_photo(user_id, question["photo"], caption=text, reply_markup=markup)
+    elif "gif" in question:
+        await bot.send_animation(user_id, question["gif"], caption=text, reply_markup=markup)
+    else:
+        await bot.send_message(user_id, text, reply_markup=markup)
+
+    await QuizState.question_id.set()
+    await state.update_data(current_question_id=question["id"])
+
+@dp.message_handler(state=QuizState.question_id)
+async def handle_answer(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    current_question_id = data.get("current_question_id")
+    current_question = questions_dict.get(current_question_id)
+
+    if not current_question:
+        await message.answer("Ошибка опроса. Попробуйте позже.")
+        await state.finish()
+        return
+
+    answer = message.text
+
+    # Проверка ветвления
+    next_question_id = None
+    if "branches" in current_question:
+        next_question_id = current_question["branches"].get(answer)
+    if not next_question_id:
+        # Если нет ветвления или не нашли ветку — идем по порядку
+        current_index = questions.index(current_question)
+        if current_index + 1 < len(questions):
+            next_question_id = questions[current_index + 1]["id"]
+        else:
+            next_question_id = None
+
+    if next_question_id:
+        next_question = questions_dict.get(next_question_id)
+        if next_question:
+            await send_question(message.chat.id, next_question, state)
+        else:
+            await message.answer("Ошибка перехода к следующему вопросу.")
+            await state.finish()
+    else:
+        await message.answer("Спасибо за прохождение опроса!", reply_markup=types.ReplyKeyboardRemove())
+        await state.finish()
 
 if __name__ == '__main__':
     executor.start_polling(dp)
