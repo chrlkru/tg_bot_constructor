@@ -2,11 +2,12 @@
 /backend/__pycache__/
 /backend/**/*.db
 /backend/.env
-/backend/**/exports/
+/backend/app/exports/
+/backend/.idea/
 # Frontend
 /frontend/node_modules/
 /frontend/build/
 
-# IDE and editor settings
-.idea/
+/.venv/
+/.idea/
 .vscode/
