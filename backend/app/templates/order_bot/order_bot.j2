@@ -1,0 +1,371 @@
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from PIL import Image, ImageDraw, ImageFont
+from pathlib import Path
+from app.database import (
+    get_products_list, add_to_cart, get_cart_items, update_cart_item,
+    delete_cart_item, clear_cart, save_order,
+    add_product, delete_product, ban_user, is_banned
+)
+import sqlite3
+import os
+
+# --- Конфиг ---
+bot = Bot(token="{{ project.token }}")
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
+
+PROJECT_ID = {{ project.id }}
+ADMIN_CHAT = {{ project.content.admin_chat_id }}
+
+# --- FSM-состояния ---
+class CatalogState(StatesGroup):
+    page = State()
+
+class CartState(StatesGroup):
+    viewing = State()
+    checkout_address = State()
+    checkout_media = State()
+    checkout_confirm = State()
+
+class ProductAdminState(StatesGroup):
+    name = State()
+    short_desc = State()
+    full_desc = State()
+    waiting_img = State()
+
+class DeleteProductState(StatesGroup):
+    selecting_page = State()
+    confirming_delete = State()
+
+# --- Функция генерации коллажа ---
+LAYOUTS = {
+    1: [(0,0,900,1200)],
+    2: [(0,0,450,1200),(450,0,450,1200)],
+    3: [(0,0,600,1200),(600,0,300,600),(600,600,300,600)],
+    4: [(0,0,450,600),(450,0,450,600),(0,600,450,600),(450,600,450,600)],
+    5: [(0,0,900,600),(0,600,300,600),(300,600,300,600),(600,600,300,600),(300,0,300,600)],
+    6: [(x*300, y*600, 300,600) for y in range(2) for x in range(3)],
+    7: [(0,0,600,800),(600,0,300,400),(600,400,300,400)] +
+       [(x*300,800,300,400) for x in range(3)] + [(0,800,300,400)],
+    8: [(x*300,y*400,300,400) for y in range(2) for x in range(4)],
+    9: [(x*300,y*400,300,400) for y in range(3) for x in range(3)],
+}
+
+def generate_collage(image_paths, output_path):
+    n = len(image_paths)
+    layout = LAYOUTS.get(n, LAYOUTS[9])
+    W, H = 900, 1200
+    collage = Image.new("RGB", (W, H), "white")
+    font = ImageFont.truetype("arial.ttf", size=40)
+    for idx, path in enumerate(image_paths):
+        img = Image.open(path).resize((layout[idx][2], layout[idx][3]), Image.ANTIALIAS)
+        x,y,_,_ = layout[idx]
+        collage.paste(img, (x,y))
+        draw = ImageDraw.Draw(collage)
+        draw.text((x+10,y+10), str(idx+1), font=font, fill="white")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    collage.save(output_path)
+    return output_path
+
+# --- КАТАЛОГ ---
+
+@dp.message_handler(commands=['catalog','start'])
+async def cmd_catalog(msg: types.Message, state: FSMContext):
+    if is_banned(PROJECT_ID, msg.from_user.id):
+        return await msg.answer("❌ Вы заблокированы.")
+    await state.update_data(page=1)
+    await send_catalog_page(msg.chat.id, state)
+
+async def send_catalog_page(chat_id, state: FSMContext):
+    data = await state.get_data()
+    page = data.get('page',1)
+    prods = get_products_list(PROJECT_ID)
+    slice = prods[(page-1)*9 : page*9]
+    img_paths = []
+    for p in slice:
+        path = Path(__file__).parent.parent / "media" / str(PROJECT_ID) / p["media"]
+        img_paths.append(str(path))
+    collage = generate_collage(img_paths, f"/tmp/collage_{page}.jpg")
+    kb = types.InlineKeyboardMarkup(row_width=3)
+    for i, p in enumerate(slice, start=1):
+        kb.insert(types.InlineKeyboardButton(str(i), callback_data=f"select_{i}"))
+    if page>1:
+        kb.insert(types.InlineKeyboardButton("←", callback_data="prev"))
+    if page*9 < len(prods):
+        kb.insert(types.InlineKeyboardButton("→", callback_data="next"))
+    await bot.send_photo(chat_id, collage, caption=f"Страница {page}", reply_markup=kb)
+    await CatalogState.page.set()
+
+@dp.callback_query_handler(lambda c: c.data in ['prev','next'], state=CatalogState.page)
+async def on_nav(c: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    page = data.get('page',1)
+    prods = get_products_list(PROJECT_ID)
+    if c.data=='prev' and page>1: page-=1
+    if c.data=='next' and page*9 < len(prods): page+=1
+    await state.update_data(page=page)
+    await send_catalog_page(c.from_user.id, state)
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("select_"), state=CatalogState.page)
+async def on_select(c: types.CallbackQuery, state: FSMContext):
+    idx = int(c.data.split("_")[1]) - 1
+    data = await state.get_data(); page = data['page']
+    prods = get_products_list(PROJECT_ID)
+    global_idx = (page-1)*9 + idx
+    if global_idx >= len(prods):
+        return await c.answer("Неправильный выбор", show_alert=True)
+    p = prods[global_idx]
+    # отправляем карточку
+    media_path = Path(__file__).parent.parent / "media" / str(PROJECT_ID) / p["media"]
+    if media_path.exists():
+        await bot.send_photo(c.from_user.id, open(media_path, "rb"),
+            caption=f"{p['name']}\n\n{p['full_desc']}")
+    else:
+        await bot.send_message(c.from_user.id, f"{p['name']}\n\n{p['full_desc']}")
+    # кнопки
+    kb = types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton("➕ В корзину", callback_data=f"addcart_{p['id']}"),
+        types.InlineKeyboardButton("← Назад",    callback_data="back")
+    )
+    await bot.send_message(c.from_user.id, "Что дальше?", reply_markup=kb)
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data=="back", state='*')
+async def on_back(c: types.CallbackQuery, state: FSMContext):
+    await send_catalog_page(c.from_user.id, state)
+    await c.answer()
+
+# --- КОРЗИНА ---
+
+@dp.callback_query_handler(lambda c: c.data.startswith("addcart_"))
+async def on_addcart(c: types.CallbackQuery):
+    pid = int(c.data.split("_")[1])
+    add_to_cart(PROJECT_ID, c.from_user.id, pid)
+    kb = types.InlineKeyboardMarkup(row_width=2).add(
+        types.InlineKeyboardButton("🛒 Перейти в корзину", callback_data="view_cart"),
+        types.InlineKeyboardButton("← Продолжить покупки", callback_data="back")
+    )
+    await c.answer("✅ Товар добавлен")
+    await bot.send_message(c.from_user.id, "Что дальше?", reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data=="view_cart")
+async def on_view_cart(c: types.CallbackQuery, state: FSMContext):
+    items = get_cart_items(PROJECT_ID, c.from_user.id)
+    if not items:
+        kb = types.InlineKeyboardMarkup().add(
+            types.InlineKeyboardButton("← В каталог", callback_data="back")
+        )
+        await bot.send_message(c.from_user.id, "🛒 Корзина пуста.", reply_markup=kb)
+        return
+    text = "🛒 Ваша корзина:\n"
+    total = 0
+    for it in items:
+        qty = it['quantity']
+        # цена можно хранить в full_desc или content
+        price = getattr(it, 'price', 0)
+        subtotal = price * qty
+        total += subtotal
+        text += f"{it['cart_id']}) {it['name']} × {qty} — {subtotal}₽\n"
+    text += f"\nИтого: {total}₽"
+    kb = types.InlineKeyboardMarkup(row_width=4)
+    for it in items:
+        cid = it['cart_id']
+        kb.insert(types.InlineKeyboardButton(f"➖{cid}", callback_data=f"dec_{cid}"))
+        kb.insert(types.InlineKeyboardButton(f"➕{cid}", callback_data=f"inc_{cid}"))
+        kb.insert(types.InlineKeyboardButton(f"🗑{cid}", callback_data=f"delcart_{cid}"))
+    kb.add(
+        types.InlineKeyboardButton("📦 Оформить заказ", callback_data="checkout"),
+        types.InlineKeyboardButton("← В каталог", callback_data="back")
+    )
+    await bot.send_message(c.from_user.id, text, reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith(("dec_","inc_","delcart_")))
+async def on_edit_cart(c: types.CallbackQuery):
+    action, cid = c.data.split("_")
+    cid = int(cid)
+    items = get_cart_items(PROJECT_ID, c.from_user.id)
+    if action=="dec":
+        q = next(it['quantity'] for it in items if it['cart_id']==cid)
+        update_cart_item(cid, q-1)
+    elif action=="inc":
+        q = next(it['quantity'] for it in items if it['cart_id']==cid)
+        update_cart_item(cid, q+1)
+    else:
+        delete_cart_item(cid)
+    await on_view_cart(c, None)
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data=="checkout")
+async def on_checkout(c: types.CallbackQuery, state: FSMContext):
+    await bot.send_message(c.from_user.id, "Введите адрес доставки:")
+    await CartState.checkout_address.set()
+    await c.answer()
+
+@dp.message_handler(state=CartState.checkout_address)
+async def handle_address(msg: types.Message, state: FSMContext):
+    await state.update_data(address=msg.text)
+    await msg.answer("Прикрепите фото/документ или напишите «нет»:")
+    await CartState.checkout_media.set()
+
+@dp.message_handler(state=CartState.checkout_media, content_types=types.ContentTypes.ANY)
+async def handle_checkout_media(msg: types.Message, state: FSMContext):
+    media = None
+    if msg.content_type in ['photo','document']:
+        saved = await msg.document.download(destination_dir=f"media/{PROJECT_ID}")
+        media = saved.name
+    await state.update_data(media=media)
+    data = await state.get_data()
+    items = get_cart_items(PROJECT_ID, msg.from_user.id)
+    text = "✅ Подтвердите заказ:\n"
+    total=0
+    for it in items:
+        qty = it['quantity']; price = getattr(it,'price',0)
+        subtotal = price*qty; total+=subtotal
+        text+=f"{it['name']} × {qty} — {subtotal}₽\n"
+    text+=f"\nАдрес: {data['address']}\nИтого: {total}₽"
+    kb = types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton("✅ Подтвердить", callback_data="confirm_order"),
+        types.InlineKeyboardButton("❌ Отменить", callback_data="cancel_order")
+    )
+    await msg.answer(text, reply_markup=kb)
+    await CartState.checkout_confirm.set()
+
+@dp.callback_query_handler(lambda c: c.data in ["confirm_order","cancel_order"], state=CartState.checkout_confirm)
+async def on_confirm_order(c: types.CallbackQuery, state: FSMContext):
+    if c.data=="cancel_order":
+        await bot.send_message(c.from_user.id, "❌ Оформление отменено")
+        await clear_cart(PROJECT_ID, c.from_user.id)
+        return await state.finish()
+    data = await state.get_data()
+    items = get_cart_items(PROJECT_ID, c.from_user.id)
+    for it in items:
+        save_order({
+            "project_id": PROJECT_ID,
+            "user_id": c.from_user.id,
+            "product": it['name'],
+            "quantity": it['quantity'],
+            "address": data['address'],
+            "media_path": data.get('media')
+        })
+    clear_cart(PROJECT_ID, c.from_user.id)
+    await bot.send_message(c.from_user.id, "✅ Заказ оформлен!")
+    await state.finish()
+
+# --- АДМИН: добавить/удалить товар ---
+
+@dp.message_handler(commands=['addproduct'])
+async def cmd_addproduct(msg: types.Message):
+    if msg.chat.id != ADMIN_CHAT: return
+    await msg.answer("🆕 Введите название товара:")
+    await ProductAdminState.name.set()
+
+@dp.message_handler(state=ProductAdminState.name)
+async def prod_name(msg: types.Message, state: FSMContext):
+    text = msg.text.strip()
+    if not text: return await state.finish()
+    await state.update_data(name=text)
+    await msg.answer("📋 Введите короткое описание:")
+    await ProductAdminState.short_desc.set()
+
+@dp.message_handler(state=ProductAdminState.short_desc)
+async def prod_short(msg: types.Message, state: FSMContext):
+    text = msg.text.strip()
+    if not text: return await state.finish()
+    await state.update_data(short_desc=text)
+    await msg.answer("📝 Введите полное описание или «нет»:")
+    await ProductAdminState.full_desc.set()
+
+@dp.message_handler(state=ProductAdminState.full_desc)
+async def prod_full(msg: types.Message, state: FSMContext):
+    text = msg.text.strip()
+    if not text: return await state.finish()
+    full = "" if text.lower()=="нет" else text
+    await state.update_data(full_desc=full)
+    await msg.answer("📷 Прикрепите фото/видео или «нет»:")
+    await ProductAdminState.waiting_img.set()
+
+@dp.message_handler(state=ProductAdminState.waiting_img, content_types=types.ContentTypes.ANY)
+async def prod_media(msg: types.Message, state: FSMContext):
+    media_path = ""
+    if msg.content_type in ['photo','document','video']:
+        saved = await msg.document.download(destination_dir=f"media/{PROJECT_ID}")
+        media_path = saved.name
+    elif msg.text.lower()=="нет":
+        media_path = ""
+    else:
+        return await state.finish()
+    data = await state.get_data()
+    pid = add_product(
+        PROJECT_ID,
+        data['name'], data['short_desc'], data['full_desc'], media_path
+    )
+    await msg.answer(f"✅ Товар #{pid} добавлен.")
+    await state.finish()
+
+@dp.message_handler(commands=['delproduct'])
+async def cmd_delproduct(msg: types.Message, state: FSMContext):
+    if msg.chat.id != ADMIN_CHAT: return
+    await state.update_data(del_page=1)
+    await send_delete_page(msg.chat.id, state)
+    await DeleteProductState.selecting_page.set()
+
+async def send_delete_page(chat_id, state):
+    data = await state.get_data()
+    page = data.get('del_page',1)
+    prods = get_products_list(PROJECT_ID)
+    slice = prods[(page-1)*9 : page*9]
+    paths = [str(Path(__file__).parent.parent / "media" / str(PROJECT_ID) / p["media"]) for p in slice]
+    collage = generate_collage(paths, f"/tmp/del_{page}.jpg")
+    kb = types.InlineKeyboardMarkup(row_width=3)
+    for i in range(len(slice)):
+        kb.insert(types.InlineKeyboardButton(str(i+1), callback_data=f"del_sel_{i+1}"))
+    if page>1: kb.insert(types.InlineKeyboardButton("←", callback_data="del_prev"))
+    if page*9 < len(prods): kb.insert(types.InlineKeyboardButton("→", callback_data="del_next"))
+    await bot.send_photo(chat_id, collage, "Выберите товар для удаления:", reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data in ["del_prev","del_next"], state=DeleteProductState.selecting_page)
+async def on_del_nav(c: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    page = data['del_page']
+    prods = get_products_list(PROJECT_ID)
+    if c.data=="del_prev" and page>1: page-=1
+    if c.data=="del_next" and page*9 < len(prods): page+=1
+    await state.update_data(del_page=page)
+    await send_delete_page(c.from_user.id, state)
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("del_sel_"), state=DeleteProductState.selecting_page)
+async def on_del_select(c: types.CallbackQuery, state: FSMContext):
+    idx = int(c.data.split("_")[-1]) - 1
+    data = await state.get_data(); page = data['del_page']
+    prods = get_products_list(PROJECT_ID)
+    global_idx = (page-1)*9 + idx
+    if global_idx>=len(prods): return await c.answer("Неверный выбор", show_alert=True)
+    p = prods[global_idx]
+    await state.update_data(del_id=p['id'])
+    kb = types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton("✅ Подтвердить", callback_data="del_confirm"),
+        types.InlineKeyboardButton("❌ Отмена",    callback_data="del_cancel")
+    )
+    await bot.send_message(c.from_user.id, f"Удалить «{p['name']}»?", reply_markup=kb)
+    await DeleteProductState.confirming_delete.set()
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data=="del_confirm", state=DeleteProductState.confirming_delete)
+async def on_del_confirm(c: types.CallbackQuery, state: FSMContext):
+    pid = (await state.get_data())['del_id']
+    delete_product(PROJECT_ID, pid)
+    await bot.send_message(c.from_user.id, f"✅ Товар #{pid} удалён.")
+    await state.finish()
+
+@dp.callback_query_handler(lambda c: c.data=="del_cancel", state=DeleteProductState.confirming_delete)
+async def on_del_cancel(c: types.CallbackQuery, state: FSMContext):
+    await bot.send_message(c.from_user.id, "❌ Удаление отменено.")
+    await state.finish()
+
+if __name__ == '__main__':
+    executor.start_polling(dp)

@@ -10,18 +10,16 @@ import shutil
 import os
 import json
 
-# Новый импорт для CORS
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# Конфигурация CORS (добавлено!)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Фронтенд на React обычно работает здесь
+    allow_origins=["http://localhost:3000"],  # адрес фронтенда
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
 init_db()
@@ -34,9 +32,6 @@ def root():
 async def create_new_project(
     project: str = Form(...)
 ):
-    """
-    Создание нового проекта: принимает JSON как строку через form-data
-    """
     try:
         project_dict = json.loads(project)
         bot_project = BotProject(**project_dict)
@@ -51,9 +46,6 @@ async def upload_media(
     project_id: int,
     files: List[UploadFile] = File(...)
 ):
-    """
-    Загрузка медиафайлов для проекта
-    """
     project = get_projects(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Проект не найден")
@@ -70,36 +62,34 @@ async def upload_media(
 
 @app.get("/projects/{project_id}/export")
 def export_bot(project_id: int):
-    """
-    Экспорт проекта в zip-архив
-    """
     project = get_projects(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Проект не найден")
 
     template_type = project["template_type"]
     template_path = Path(__file__).parent / "templates" / template_type
-    if not template_path.exists():
-        raise HTTPException(status_code=404, detail="Шаблон не найден")
+    template_file = template_path / f"{template_type}.py.j2"
+
+    if not template_file.exists():
+        raise HTTPException(status_code=404, detail="Файл шаблона не найден")
 
     export_dir = Path(__file__).parent / "exports" / f"project_{project_id}"
     export_dir.mkdir(parents=True, exist_ok=True)
 
     env = Environment(loader=FileSystemLoader(template_path))
-    for tpl_file in template_path.glob("*.j2"):
-        template = env.get_template(tpl_file.name)
-        rendered = template.render(project=project)
-        output_file = export_dir / tpl_file.name.replace(".j2", "")
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(rendered)
+    template = env.get_template(f"{template_type}.py.j2")
+    rendered = template.render(project=project)
 
+    output_file = export_dir / "bot.py"
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(rendered)
+
+    # Добавляем стандартные файлы
     with open(export_dir / ".env", "w", encoding="utf-8") as f:
         f.write(f'TOKEN={project["token"]}\n')
 
     with open(export_dir / "requirements.txt", "w", encoding="utf-8") as f:
-        f.write("aiogram\n")
-        f.write("python-dotenv\n")
-        f.write("openpyxl\n")
+        f.write("aiogram\npython-dotenv\nPillow\nopenpyxl\n")
 
     with open(export_dir / "README.md", "w", encoding="utf-8") as f:
         f.write(f"# {project['name']}\n\n")
@@ -114,12 +104,14 @@ def export_bot(project_id: int):
         f.write("import os\n")
         f.write("import subprocess\n")
         f.write("import sys\n\n")
+        f.write("# Установка зависимостей\n")
         f.write("def install_requirements():\n")
         f.write("    try:\n")
-        f.write("        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-r requirements.txt'])\n")
+        f.write("        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt'])\n")
         f.write("    except subprocess.CalledProcessError as e:\n")
         f.write("        print('Ошибка при установке зависимостей:', e)\n")
         f.write("        sys.exit(1)\n\n")
+        f.write("# Запуск бота\n")
         f.write("def run_bot():\n")
         f.write("    from aiogram import Bot, Dispatcher, executor, types\n")
         f.write("    from dotenv import load_dotenv\n\n")
@@ -134,13 +126,13 @@ def export_bot(project_id: int):
         f.write("    install_requirements()\n")
         f.write("    run_bot()\n")
 
-    # Копируем медиа-файлы, если есть
+    # Копируем медиа
     media_src = Path(__file__).parent.parent / "media" / str(project_id)
     media_dst = export_dir / "media"
     if media_src.exists():
         shutil.copytree(media_src, media_dst)
 
-    # Создаём ZIP архив
+    # Архивируем
     zip_path = Path(__file__).parent / "exports" / f"project_{project_id}.zip"
     with ZipFile(zip_path, "w") as zipf:
         for file in export_dir.rglob("*"):
