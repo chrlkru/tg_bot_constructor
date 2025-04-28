@@ -2,6 +2,9 @@ from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
+from openpyxl import Workbook, load_workbook
+import os
+from datetime import datetime
 
 bot = Bot(token="{{ project.token }}")
 storage = MemoryStorage()
@@ -15,70 +18,86 @@ class QuizState(StatesGroup):
 
 questions_dict = {q["id"]: q for q in questions}
 
+def append_results_to_excel(file_path, survey_id, user_id, answers):
+    if os.path.exists(file_path):
+        wb = load_workbook(file_path)
+        ws = wb.active
+    else:
+        wb = Workbook()
+        ws = wb.active
+        headers = ['timestamp', 'survey_id', 'user_id'] + [f"q_{qid}" for qid in answers.keys()]
+        ws.append(headers)
+    row = [datetime.now().isoformat(), survey_id, user_id] + list(answers.values())
+    ws.append(row)
+    wb.save(file_path)
+
 @dp.message_handler(commands=['start'])
 async def start_quiz(message: types.Message, state: FSMContext):
-    # Отправляем стартовое сообщение
+    # стартовое сообщение
     if "photo" in start_message:
         await message.answer_photo(start_message["photo"], caption=start_message["text"])
     elif "gif" in start_message:
         await message.answer_animation(start_message["gif"], caption=start_message["text"])
     else:
         await message.answer(start_message["text"])
-
-    # Начинаем с первого вопроса
-    first_question = questions[0]
-    await send_question(message.chat.id, first_question, state)
+    # начинаем с первого вопроса
+    first_q = questions[0]
+    await send_question(message.chat.id, first_q, state)
 
 async def send_question(user_id, question, state: FSMContext):
     text = question["text"]
-    options = question.get("options", [])
+    opts = question.get("options", [])
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    for opt in options:
-        markup.add(opt)
-
+    for o in opts:
+        markup.add(o)
     if "photo" in question:
         await bot.send_photo(user_id, question["photo"], caption=text, reply_markup=markup)
     elif "gif" in question:
         await bot.send_animation(user_id, question["gif"], caption=text, reply_markup=markup)
     else:
         await bot.send_message(user_id, text, reply_markup=markup)
-
     await QuizState.question_id.set()
     await state.update_data(current_question_id=question["id"])
 
 @dp.message_handler(state=QuizState.question_id)
 async def handle_answer(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    current_question_id = data.get("current_question_id")
-    current_question = questions_dict.get(current_question_id)
-
-    if not current_question:
+    current_qid = data.get("current_question_id")
+    q = questions_dict.get(current_qid)
+    if not q:
         await message.answer("Ошибка опроса. Попробуйте позже.")
         await state.finish()
         return
 
-    answer = message.text
+    # сохраняем ответ
+    answers = data.get("answers", {})
+    answers[current_qid] = message.text
+    await state.update_data(answers=answers)
 
-    # Проверка ветвления
-    next_question_id = None
-    if "branches" in current_question:
-        next_question_id = current_question["branches"].get(answer)
-    if not next_question_id:
-        # Если нет ветвления или не нашли ветку — идем по порядку
-        current_index = questions.index(current_question)
-        if current_index + 1 < len(questions):
-            next_question_id = questions[current_index + 1]["id"]
-        else:
-            next_question_id = None
+    # определяем следующий вопрос
+    next_qid = None
+    if "branches" in q:
+        next_qid = q["branches"].get(message.text)
+    if not next_qid:
+        idx = questions.index(q)
+        if idx + 1 < len(questions):
+            next_qid = questions[idx + 1]["id"]
 
-    if next_question_id:
-        next_question = questions_dict.get(next_question_id)
-        if next_question:
-            await send_question(message.chat.id, next_question, state)
+    if next_qid:
+        nxt = questions_dict.get(next_qid)
+        if nxt:
+            await send_question(message.chat.id, nxt, state)
         else:
             await message.answer("Ошибка перехода к следующему вопросу.")
             await state.finish()
     else:
+        # экспортируем результаты в Excel
+        append_results_to_excel(
+            file_path=f"survey_results_{{ project['id'] }}.xlsx",
+            survey_id={{ project['id'] }},
+            user_id=message.from_user.id,
+            answers=answers
+        )
         await message.answer("Спасибо за прохождение опроса!", reply_markup=types.ReplyKeyboardRemove())
         await state.finish()
 
