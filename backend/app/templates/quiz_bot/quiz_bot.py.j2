@@ -3,6 +3,7 @@ from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from openpyxl import Workbook, load_workbook
+from pathlib import Path
 import os
 from datetime import datetime
 
@@ -10,13 +11,19 @@ bot = Bot(token="{{ project.token }}")
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
-questions = {{ project.content.questions }}
-start_message = {{ project.content.start_message }}
-
+# === FSM для опроса ===
 class QuizState(StatesGroup):
     question_id = State()
 
+# Админ-чат для уведомлений и команд
+ADMIN_CHAT = {{ project.content.admin_chat_id }}
+
+# Вопросы из content
+questions = {{ project.content.questions }}
 questions_dict = {q["id"]: q for q in questions}
+
+# Путь к Excel-файлу с результатами
+RESULTS_FILE = f"survey_results_{{ project.id }}.xlsx"
 
 def append_results_to_excel(file_path, survey_id, user_id, answers):
     if os.path.exists(file_path):
@@ -31,31 +38,40 @@ def append_results_to_excel(file_path, survey_id, user_id, answers):
     ws.append(row)
     wb.save(file_path)
 
+async def send_results_to_admin(user_id, answers):
+    # получаем username или используем ID
+    chat = await bot.get_chat(user_id)
+    name = f"@{chat.username}" if chat.username else str(user_id)
+    text = f"📋 Новый результат опроса\n\nПользователь: {name}\n\n"
+    for idx, (qid, ans) in enumerate(answers.items(), start=1):
+        qtext = questions_dict[qid]["text"]
+        text += f"{idx}. {qtext} — {ans}\n"
+    text += f"\nВремя: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+    await bot.send_message(ADMIN_CHAT, text)
+
 @dp.message_handler(commands=['start'])
 async def start_quiz(message: types.Message, state: FSMContext):
-    # стартовое сообщение
-    if "photo" in start_message:
-        await message.answer_photo(start_message["photo"], caption=start_message["text"])
-    elif "gif" in start_message:
-        await message.answer_animation(start_message["gif"], caption=start_message["text"])
+    start_msg = {{ project.content.start_message }}
+    if "photo" in start_msg:
+        await message.answer_photo(start_msg["photo"], caption=start_msg["text"])
+    elif "gif" in start_msg:
+        await message.answer_animation(start_msg["gif"], caption=start_msg["text"])
     else:
-        await message.answer(start_message["text"])
-    # начинаем с первого вопроса
+        await message.answer(start_msg["text"])
     first_q = questions[0]
     await send_question(message.chat.id, first_q, state)
 
 async def send_question(user_id, question, state: FSMContext):
-    text = question["text"]
     opts = question.get("options", [])
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     for o in opts:
         markup.add(o)
     if "photo" in question:
-        await bot.send_photo(user_id, question["photo"], caption=text, reply_markup=markup)
+        await bot.send_photo(user_id, question["photo"], caption=question["text"], reply_markup=markup)
     elif "gif" in question:
-        await bot.send_animation(user_id, question["gif"], caption=text, reply_markup=markup)
+        await bot.send_animation(user_id, question["gif"], caption=question["text"], reply_markup=markup)
     else:
-        await bot.send_message(user_id, text, reply_markup=markup)
+        await bot.send_message(user_id, question["text"], reply_markup=markup)
     await QuizState.question_id.set()
     await state.update_data(current_question_id=question["id"])
 
@@ -63,18 +79,12 @@ async def send_question(user_id, question, state: FSMContext):
 async def handle_answer(message: types.Message, state: FSMContext):
     data = await state.get_data()
     current_qid = data.get("current_question_id")
-    q = questions_dict.get(current_qid)
-    if not q:
-        await message.answer("Ошибка опроса. Попробуйте позже.")
-        await state.finish()
-        return
-
-    # сохраняем ответ
     answers = data.get("answers", {})
     answers[current_qid] = message.text
     await state.update_data(answers=answers)
 
-    # определяем следующий вопрос
+    # ветвление или следующий вопрос
+    q = questions_dict[current_qid]
     next_qid = None
     if "branches" in q:
         next_qid = q["branches"].get(message.text)
@@ -84,22 +94,88 @@ async def handle_answer(message: types.Message, state: FSMContext):
             next_qid = questions[idx + 1]["id"]
 
     if next_qid:
-        nxt = questions_dict.get(next_qid)
-        if nxt:
-            await send_question(message.chat.id, nxt, state)
-        else:
-            await message.answer("Ошибка перехода к следующему вопросу.")
-            await state.finish()
+        nxt = questions_dict[next_qid]
+        await send_question(message.chat.id, nxt, state)
     else:
-        # экспортируем результаты в Excel
-        append_results_to_excel(
-            file_path=f"survey_results_{{ project['id'] }}.xlsx",
-            survey_id={{ project['id'] }},
-            user_id=message.from_user.id,
-            answers=answers
-        )
+        # завершение: сохраняем и уведомляем
+        answers = (await state.get_data())["answers"]
+        append_results_to_excel(RESULTS_FILE, {{ project.id }}, message.from_user.id, answers)
+        await send_results_to_admin(message.from_user.id, answers)
         await message.answer("Спасибо за прохождение опроса!", reply_markup=types.ReplyKeyboardRemove())
         await state.finish()
+
+# === Админ-команды ===
+
+@dp.message_handler(commands=['stats'])
+async def send_stats(message: types.Message):
+    if message.chat.id != ADMIN_CHAT:
+        return
+    if not os.path.exists(RESULTS_FILE):
+        return await message.answer("Нет данных для статистики.")
+    wb = load_workbook(RESULTS_FILE)
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    headers = rows[0]
+    data_rows = rows[1:]
+    total = len(data_rows)
+    text = f"📊 Обобщённая статистика по опросу:\nВсего прохождений: {total}\n\n"
+    for col_idx, header in enumerate(headers[3:], start=3):
+        counts = {}
+        for row in data_rows:
+            ans = row[col_idx]
+            counts[ans] = counts.get(ans, 0) + 1
+        qid = int(header.split('_')[1])
+        qtext = questions_dict[qid]["text"]
+        text += f"{qid}. {qtext}\n"
+        for ans, cnt in counts.items():
+            text += f"  — {ans}: {cnt}\n"
+        text += "\n"
+    await message.answer(text)
+
+@dp.message_handler(commands=['top'])
+async def send_top(message: types.Message):
+    if message.chat.id != ADMIN_CHAT:
+        return
+    args = message.get_args().split('|')
+    if len(args) != len(questions):
+        return await message.answer(
+            "Нужно передать список правильных ответов через | в количестве вопросов.")
+    correct = [a.strip() for a in args]
+    if not os.path.exists(RESULTS_FILE):
+        return await message.answer("Нет данных для анализа.")
+    wb = load_workbook(RESULTS_FILE)
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))[1:]
+    best, max_correct = [], -1
+    for row in rows:
+        user_id = row[2]
+        user_answers = list(row[3:])
+        score = sum(1 for ua, ca in zip(user_answers, correct) if ua == ca)
+        if score > max_correct:
+            best, max_correct = [user_id], score
+        elif score == max_correct:
+            best.append(user_id)
+    if max_correct <= 0:
+        return await message.answer("Никто не ответил ни на один вопрос правильно.")
+    names = []
+    for uid in set(best):
+        chat = await bot.get_chat(uid)
+        names.append(f"@{chat.username}" if chat.username else str(uid))
+    text = f"🏅 Лучшие ({max_correct} правильных):\n" + "\n".join(names)
+    await message.answer(text)
+
+@dp.message_handler(commands=['export'])
+async def cmd_export_results(message: types.Message):
+    if message.chat.id != ADMIN_CHAT:
+        return
+    file_path = Path(RESULTS_FILE)
+    if not file_path.exists():
+        return await message.answer("❌ Файл с результатами ещё не создан.")
+    await bot.send_document(
+        ADMIN_CHAT,
+        document=open(file_path, "rb"),
+        caption="📥 Excel с результатами опроса"
+    )
 
 if __name__ == '__main__':
     executor.start_polling(dp)
