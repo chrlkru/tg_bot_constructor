@@ -1,0 +1,99 @@
+/* MainPage.css */
+
+.main-page {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+    background-color: #f5f7fa;
+    font-family: Arial, sans-serif;
+  }
+  
+  /* Верхняя секция */
+  .hero-section {
+    background: linear-gradient(to right, #1e3a8a, #93c5fd);
+    border-bottom-left-radius: 30px;
+    border-bottom-right-radius: 30px;
+    padding: 40px 20px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+  }
+  
+  .hero-text {
+    color: white;
+    max-width: 500px;
+    margin: 20px;
+  }
+  
+  .hero-text h1 {
+    font-size: 32px;
+    margin-bottom: 20px;
+  }
+  
+  .hero-text p {
+    font-size: 18px;
+    margin-bottom: 20px;
+  }
+  
+  .create-bot-button {
+    padding: 12px 24px;
+    background-color: white;
+    border: none;
+    border-radius: 10px;
+    color: black;
+    font-weight: bold;
+    cursor: pointer;
+  }
+  
+  .create-bot-button:hover {
+    background-color: #445279;
+  }
+  
+  .hero-image img {
+    width: 250px;
+    margin: 20px;
+  }
+  
+  /* Секция преимуществ */
+  .advantages-section {
+    padding: 60px 20px;
+    text-align: center;
+  }
+  
+  .advantages-section h2 {
+    font-size: 28px;
+    margin-bottom: 40px;
+  }
+  
+  .advantages-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+    justify-content: center;
+  }
+  
+  .advantage-card {
+    background-color: white;
+    border-radius: 20px;
+    padding: 30px 20px;
+    width: 250px;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
+  }
+  
+  .plus-sign {
+    font-size: 40px;
+    color: #1e3a8a;
+    margin-bottom: 15px;
+  }
+  
+  .advantage-card h3 {
+    font-size: 18px;
+    margin-bottom: 10px;
+  }
+  
+  .advantage-card p {
+    font-size: 14px;
+    color: #555;
+  }
+  
