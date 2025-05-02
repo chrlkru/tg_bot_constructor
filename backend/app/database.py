@@ -112,7 +112,77 @@ def init_db():
             media_path TEXT
         )
         """)
-
+        # Helper-bot: «пасты»
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS helper_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER,
+            alias TEXT UNIQUE,
+            content TEXT,
+            media_path TEXT
+        )
+        """)
+        # Moderator-bot: настройки
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS moderation_settings (
+            project_id    INTEGER PRIMARY KEY,
+            allow_media    INTEGER DEFAULT 0,
+            allow_stickers INTEGER DEFAULT 0,
+            censor_enabled INTEGER DEFAULT 1,
+            flood_max      INTEGER DEFAULT 3,
+            flood_window_s INTEGER DEFAULT 600
+        )
+        """)
+        # Moderator-bot: белый список доменов
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS link_whitelist (
+            project_id INTEGER,
+            domain     TEXT,
+            PRIMARY KEY(project_id, domain)
+        )
+        """)
+        # Moderator-bot: предупреждения (страйки)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_warnings (
+            project_id INTEGER,
+            chat_id    INTEGER,
+            user_id    INTEGER,
+            strikes    INTEGER DEFAULT 0,
+            last_ts    INTEGER,
+            PRIMARY KEY(project_id, chat_id, user_id)
+        )
+        """)
+        # Moderator-bot: логирование нарушений
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS moderation_logs (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER,
+            chat_id    INTEGER,
+            user_id    INTEGER,
+            message_id INTEGER,
+            violation  TEXT,
+            text       TEXT,
+            ts         INTEGER
+        )
+        """)
+ # Anonymous‑Feedback: лог и бан‑лист
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS feedback_messages (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id  INTEGER,
+            user_id     INTEGER,
+            direction   TEXT,          -- 'in' | 'out'
+            text        TEXT,
+            ts          INTEGER
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS feedback_blocked (
+            project_id INTEGER,
+            user_id    INTEGER,
+            PRIMARY KEY(project_id, user_id)
+        )
+        """)
 def create_project(project):
     with transaction(DB_PATH) as conn:
         cur = conn.execute(
@@ -316,10 +386,9 @@ def activate_planned_exception(exception_id):
             (exception_id,)
         )
         row = conn.execute(
-            "SELECT start_dt,end_dt FROM work_exceptions WHERE id=?",
-            (exception_id,)
+            "SELECT start_dt,end_dt FROM work_exceptions WHERE id=?", (exception_id,)
         ).fetchone()
-        return row  # (start_iso, end_iso)
+        return row
 
 def cancel_bookings_in_interval(project_id, start_iso, end_iso):
     with transaction(DB_PATH) as conn:
@@ -411,13 +480,11 @@ def update_cart_item(cart_id, new_quantity):
     with transaction(DB_PATH) as conn:
         if new_quantity > 0:
             conn.execute(
-                "UPDATE cart_items SET quantity=? WHERE id=?",
-                (new_quantity, cart_id)
+                "UPDATE cart_items SET quantity=? WHERE id=?", (new_quantity, cart_id)
             )
         else:
             conn.execute(
-                "DELETE FROM cart_items WHERE id=?",
-                (cart_id,)
+                "DELETE FROM cart_items WHERE id=?", (cart_id,)
             )
 
 def delete_cart_item(cart_id):
@@ -427,8 +494,7 @@ def delete_cart_item(cart_id):
 def clear_cart(project_id, user_id):
     with transaction(DB_PATH) as conn:
         conn.execute(
-            "DELETE FROM cart_items WHERE project_id=? AND user_id=?",
-            (project_id, user_id)
+            "DELETE FROM cart_items WHERE project_id=? AND user_id=?", (project_id, user_id)
         )
 
 def get_faq_entries(project_id):
@@ -453,6 +519,5 @@ def add_faq_entry(project_id, question, answer, media_path=""):
 def delete_faq_entry(project_id, entry_id):
     with transaction(DB_PATH) as conn:
         conn.execute(
-            "DELETE FROM faq_entries WHERE project_id=? AND id=?",
-            (project_id, entry_id)
+            "DELETE FROM faq_entries WHERE project_id=? AND id=?", (project_id, entry_id)
         )

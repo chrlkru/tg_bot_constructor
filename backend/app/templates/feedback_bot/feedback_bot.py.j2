@@ -1,0 +1,96 @@
+{# templates/feedback_bot/feedback_bot.py.j2 #}
+#!/usr/bin/env python3
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+
+from app.utils.feedback import log_feedback, block_user, is_blocked
+
+BOT_TOKEN  = "{{ project.token }}"
+PROJECT_ID = {{ project.id }}
+ADMIN_CHAT = {{ project.content.admin_chat_id }}
+
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+dp  = Dispatcher(bot, storage=MemoryStorage())
+
+# ── FSM для ответа админа ────────────────────────
+class ReplyState(StatesGroup):
+    waiting_text = State()
+
+# ── Пользователь присылает любое сообщение ───────
+@dp.message_handler(chat_type=types.ChatType.PRIVATE, content_types=types.ContentTypes.ANY)
+async def handle_incoming(msg: types.Message):
+    if is_blocked(PROJECT_ID, msg.from_user.id):
+        return
+    # Логируем текст или подпись
+    text = msg.text or msg.caption or ""
+    log_feedback(PROJECT_ID, msg.from_user.id, 'in', text)
+
+    # Форвардим оригинал вместе с медиа в админ-чат
+    fwd = await bot.forward_message(
+        ADMIN_CHAT,
+        msg.chat.id,
+        msg.message_id
+    )
+
+    # Кнопки «Ответить» и «Бан»
+    kb = types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton("✉️ Ответить", callback_data=f"reply_{msg.from_user.id}"),
+        types.InlineKeyboardButton("🚫 Бан",      callback_data=f"ban_{msg.from_user.id}")
+    )
+    await bot.send_message(
+        ADMIN_CHAT,
+        f"📬 Сообщение от <code>{msg.from_user.id}</code> переслано (msg #{fwd.message_id}).",
+        reply_markup=kb
+    )
+
+    await msg.answer("✅ Ваше сообщение получено! Администратор свяжется с вами.")
+
+# ── Начало ответа админа ─────────────────────────
+@dp.callback_query_handler(lambda c: c.data.startswith("reply_") and c.message.chat.id==ADMIN_CHAT)
+async def admin_reply_start(c: types.CallbackQuery, state: FSMContext):
+    uid = int(c.data.split("_")[1])
+    await state.update_data(target_uid=uid)
+    await c.message.answer(f"✉️ Напишите ответ для <code>{uid}</code> (или /cancel)")
+    await ReplyState.waiting_text.set()
+    await c.answer()
+
+# ── Отмена ответа ────────────────────────────────
+@dp.message_handler(commands=['cancel'], state=ReplyState.waiting_text)
+async def admin_reply_cancel(msg: types.Message, state: FSMContext):
+    await state.finish()
+    await msg.answer("❎ Отменено.")
+
+# ── Отправка ответа пользователю ─────────────────
+@dp.message_handler(state=ReplyState.waiting_text, chat_type=types.ChatType.PRIVATE)
+async def admin_reply_send(msg: types.Message, state: FSMContext):
+    data = await state.get_data()
+    uid  = data['target_uid']
+    await bot.send_message(uid, msg.text)
+    log_feedback(PROJECT_ID, uid, 'out', msg.text)
+    await msg.answer("✅ Ответ отправлен.")
+    await state.finish()
+
+# ── Бан пользователя ────────────────────────────
+@dp.callback_query_handler(lambda c: c.data.startswith("ban_") and c.message.chat.id==ADMIN_CHAT)
+async def admin_ban(c: types.CallbackQuery):
+    uid = int(c.data.split("_")[1])
+    block_user(PROJECT_ID, uid)
+    await c.message.edit_text(f"🚫 Пользователь <code>{uid}</code> заблокирован.")
+    try:
+        await bot.send_message(uid, "🚫 Ваши сообщения больше не принимаются.")
+    except:
+        pass
+    await c.answer("Пользователь заблокирован")
+
+# ── Команды помощи ───────────────────────────────
+@dp.message_handler(commands=['start','help'], chat_type=types.ChatType.PRIVATE)
+async def cmd_start(msg: types.Message):
+    await msg.answer(
+        "🤖 Напишите любое сообщение — оно анонимно уйдёт администратору.\n"
+        "Админ сможет ответить через бота."
+    )
+
+if __name__ == "__main__":
+    executor.start_polling(dp, skip_updates=True)

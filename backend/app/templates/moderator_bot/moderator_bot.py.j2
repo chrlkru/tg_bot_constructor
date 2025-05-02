@@ -1,0 +1,121 @@
+{# templates/moderator_bot/bot.py.j2 #}
+#!/usr/bin/env python3
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+
+from app.utils.moderation import (
+    check_message, add_strike, log_violation,
+    format_report, toggle_setting,
+    whitelist_add, whitelist_del, list_whitelist,
+    get_settings
+)
+
+BOT_TOKEN  = "{{ project.token }}"
+PROJECT_ID = {{ project.id }}
+ADMIN_CHAT = {{ project.content.admin_chat_id }}
+
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+dp  = Dispatcher(bot, storage=MemoryStorage())
+
+# ── Автоматический фильтр ───────────────────────────────
+@dp.message_handler(content_types=types.ContentTypes.ANY)
+async def auto_filter(msg: types.Message):
+    ct  = msg.content_type
+    txt = msg.text or msg.caption or ""
+    violations = check_message(PROJECT_ID, msg.chat.id, msg.from_user.id, txt, ct)
+    if not violations:
+        return
+    await msg.delete()
+    strikes = add_strike(PROJECT_ID, msg.chat.id, msg.from_user.id)
+    log_violation(
+        PROJECT_ID, msg.chat.id, msg.from_user.id,
+        msg.message_id, ",".join(violations), txt
+    )
+    if "spam" in violations:
+        await bot.kick_chat_member(msg.chat.id, msg.from_user.id)
+        await bot.send_message(
+            msg.chat.id,
+            f"🚫 {msg.from_user.get_mention(as_html=True)} заблокирован за флуд."
+        )
+    else:
+        if strikes >= 3:
+            await bot.kick_chat_member(msg.chat.id, msg.from_user.id)
+            await bot.send_message(
+                msg.chat.id,
+                f"🚫 {msg.from_user.get_mention(as_html=True)} заблокирован (3 предупреждения)."
+            )
+        else:
+            await bot.send_message(
+                msg.chat.id,
+                f"⚠️ {msg.from_user.get_mention(as_html=True)}, предупреждение "
+                f"({strikes}/3). Нарушения: {', '.join(violations)}."
+            )
+
+# ── Жалоба через /report ──────────────────────────────────
+@dp.message_handler(commands=['report'])
+async def report_handler(msg: types.Message):
+    if not msg.reply_to_message:
+        return await msg.answer(
+            "Чтобы пожаловаться, ответьте на сообщение и введите /report [причина]"
+        )
+    reporter = msg.from_user.username or msg.from_user.id
+    orig     = msg.reply_to_message
+    reason   = msg.get_args()
+    await bot.forward_message(ADMIN_CHAT, orig.chat.id, orig.message_id)
+    text = format_report(reporter, orig.chat.id, orig.message_id, reason)
+    await bot.send_message(ADMIN_CHAT, text)
+    await msg.answer("✅ Жалоба отправлена админам.")
+
+# ── Админ-команды для настроек ───────────────────────────
+@dp.message_handler(commands=['set_media'])
+async def cmd_set_media(msg: types.Message):
+    arg = msg.get_args().lower()
+    val = 1 if arg in ("on","yes","1","true") else 0
+    toggle_setting(PROJECT_ID, 'allow_media', val)
+    await msg.answer(f"media {'ON' if val else 'OFF'}")
+
+@dp.message_handler(commands=['set_stickers'])
+async def cmd_set_stickers(msg: types.Message):
+    arg = msg.get_args().lower()
+    val = 1 if arg in ("on","yes","1","true") else 0
+    toggle_setting(PROJECT_ID, 'allow_stickers', val)
+    await msg.answer(f"stickers {'ON' if val else 'OFF'}")
+
+@dp.message_handler(commands=['set_censor'])
+async def cmd_set_censor(msg: types.Message):
+    arg = msg.get_args().lower()
+    val = 1 if arg in ("on","yes","1","true") else 0
+    toggle_setting(PROJECT_ID, 'censor_enabled', val)
+    await msg.answer(f"censor {'ON' if val else 'OFF'}")
+
+@dp.message_handler(commands=['set_flood'])
+async def cmd_set_flood(msg: types.Message):
+    parts = msg.get_args().split()
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        return await msg.answer("Использование: /set_flood <max_reps> <window_minutes>")
+    maxr, winm = map(int, parts)
+    toggle_setting(PROJECT_ID, 'flood_max', maxr)
+    toggle_setting(PROJECT_ID, 'flood_window_s', winm * 60)
+    await msg.answer(f"flood_max={maxr}, window={winm}m")
+
+@dp.message_handler(commands=['whitelist_add'])
+async def cmd_whitelist_add(msg: types.Message):
+    dom = msg.get_args().strip().lower()
+    whitelist_add(PROJECT_ID, dom)
+    await msg.answer(f"Домен {dom} добавлен в whitelist")
+
+@dp.message_handler(commands=['whitelist_del'])
+async def cmd_whitelist_del(msg: types.Message):
+    dom = msg.get_args().strip().lower()
+    whitelist_del(PROJECT_ID, dom)
+    await msg.answer(f"Домен {dom} удалён из whitelist")
+
+@dp.message_handler(commands=['list_whitelist'])
+async def cmd_list_whitelist(msg: types.Message):
+    items = list_whitelist(PROJECT_ID)
+    text = "Whitelist:\n" + ("\n".join(items) if items else "— пусто —")
+    await msg.answer(text)
+
+if __name__ == "__main__":
+    executor.start_polling(dp, skip_updates=True)

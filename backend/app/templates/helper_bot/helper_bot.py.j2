@@ -1,0 +1,234 @@
+{# templates/helper_bot/bot.py.j2 #}
+#!/usr/bin/env python3
+from pathlib import Path
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.types import ContentTypes
+
+from app.utils.helper import (
+    add_helper_entry, get_helper_by_alias,
+    get_all_helper_entries, update_helper_entry, delete_helper_entry
+)
+from utils.media import save_media_file
+
+BOT_TOKEN  = "{{ project.token }}"
+PROJECT_ID = {{ project.id }}
+ADMIN_CHAT = {{ project.content.admin_chat_id }}
+
+bot     = Bot(token=BOT_TOKEN, parse_mode="HTML")
+storage = MemoryStorage()
+dp      = Dispatcher(bot, storage=storage)
+
+class AdminStates(StatesGroup):
+    in_menu         = State()
+    adding_alias    = State()
+    adding_text     = State()
+    adding_media    = State()
+    deleting_sel    = State()
+    confirming_del  = State()
+    editing_select  = State()
+    editing_field   = State()
+    editing_value   = State()
+
+def build_menu():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("➕ Новая паста", callback_data="add"),
+        InlineKeyboardButton("✏️ Изменить пасту", callback_data="edit"),
+        InlineKeyboardButton("🗑 Удалить пасту", callback_data="del"),
+        InlineKeyboardButton("🔄 Список паст", callback_data="list")
+    )
+    return kb
+
+@dp.message_handler(lambda m: m.text.startswith("/"), content_types=ContentTypes.TEXT)
+async def helper_command(msg: types.Message):
+    alias = msg.text[1:].split()[0]
+    row = get_helper_by_alias(PROJECT_ID, alias)
+    if not row:
+        return
+    content, media = row
+    if media:
+        path = Path(__file__).parent.parent / "media" / str(PROJECT_ID) / media
+        if path.exists():
+            await bot.send_document(msg.chat.id, path.open("rb"), caption=content)
+            return
+    await msg.answer(content)
+
+@dp.message_handler(commands=['adminhelp'])
+async def admin_help(msg: types.Message):
+    if msg.chat.id != ADMIN_CHAT:
+        return
+    await msg.answer("🛠 Меню Helper-bot:", reply_markup=build_menu())
+    await AdminStates.in_menu.set()
+
+# Add paste
+@dp.callback_query_handler(lambda c: c.data=="add", state=AdminStates.in_menu)
+async def add_start(c, state: FSMContext):
+    await c.message.edit_text("Введите alias (без `/`):")
+    await AdminStates.adding_alias.set()
+    await c.answer()
+
+@dp.message_handler(state=AdminStates.adding_alias)
+async def add_alias(msg, state: FSMContext):
+    await state.update_data(alias=msg.text.strip())
+    await msg.answer("Введите текст пасты (HTML):")
+    await AdminStates.adding_text.set()
+
+@dp.message_handler(state=AdminStates.adding_text, content_types=ContentTypes.TEXT)
+async def add_text(msg, state: FSMContext):
+    await state.update_data(content=msg.text)
+    await msg.answer("Прикрепите файл/фото или введите `нет`:")
+    await AdminStates.adding_media.set()
+
+@dp.message_handler(state=AdminStates.adding_media, content_types=ContentTypes.ANY)
+async def add_media(msg, state: FSMContext):
+    data = await state.get_data()
+    media = ""
+    if msg.content_type in ("photo","document"):
+        if msg.content_type=="photo":
+            file_id = msg.photo[-1].file_id
+            filename = f"{file_id}.jpg"
+            file_obj = await bot.get_file(file_id)
+            bts = await bot.download_file(file_obj.file_path)
+        else:
+            file_id = msg.document.file_id
+            filename = msg.document.file_name
+            file_obj = await bot.get_file(file_id)
+            bts = await bot.download_file(file_obj.file_path)
+        path = save_media_file(PROJECT_ID, bts, filename,
+                               Path(__file__).parent.parent/"media")
+        media = path.name
+    elif msg.text.lower()!="нет":
+        return await msg.answer("Ожидался файл или `нет`.")
+    eid = add_helper_entry(PROJECT_ID, data["alias"], data["content"], media)
+    await msg.answer(f"✅ Паста `/ {data['alias']}` создана (ID {eid})", reply_markup=build_menu())
+    await state.finish()
+
+# Edit paste
+@dp.callback_query_handler(lambda c: c.data=="edit", state=AdminStates.in_menu)
+async def edit_list(c, state: FSMContext):
+    ent = get_all_helper_entries(PROJECT_ID)
+    kb = InlineKeyboardMarkup(row_width=1)
+    for e in ent:
+        kb.add(InlineKeyboardButton(f"✏️ /{e['alias']}", callback_data=f"edit_{e['id']}"))
+    kb.add(InlineKeyboardButton("🔙 Назад", callback_data="admin_cancel"))
+    await c.message.edit_text("Выберите пасту для изменения:", reply_markup=kb)
+    await AdminStates.editing_select.set()
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("edit_"), state=AdminStates.editing_select)
+async def edit_choose(c, state: FSMContext):
+    eid = int(c.data.split("_")[1])
+    await state.update_data(edit_id=eid)
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("✏️ Alias", callback_data="field_alias"),
+        InlineKeyboardButton("✏️ Текст", callback_data="field_content"),
+        InlineKeyboardButton("✏️ Медиа", callback_data="field_media"),
+        InlineKeyboardButton("🔙 Отмена", callback_data="admin_cancel")
+    )
+    await c.message.edit_text("Что изменить?", reply_markup=kb)
+    await AdminStates.editing_field.set()
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("field_"), state=AdminStates.editing_field)
+async def edit_field_select(c, state: FSMContext):
+    field = c.data.split("_",1)[1]
+    await state.update_data(edit_field=field)
+    if field=="media":
+        prompt="Пришлите новый файл/фото или введите `нет`:"
+    elif field=="alias":
+        prompt="Введите новый alias без `/`:"
+    else:
+        prompt="Введите новый текст пасты (HTML):"
+    await c.message.edit_text(prompt)
+    await AdminStates.editing_value.set()
+    await c.answer()
+
+@dp.message_handler(state=AdminStates.editing_value, content_types=ContentTypes.ANY)
+async def edit_value(msg, state: FSMContext):
+    data = await state.get_data()
+    eid = data["edit_id"]
+    field = data["edit_field"]
+    if field=="alias":
+        new_alias = msg.text.strip()
+        update_helper_entry(PROJECT_ID, eid, alias=new_alias)
+    elif field=="content":
+        update_helper_entry(PROJECT_ID, eid, content=msg.text)
+    else:  # media
+        if msg.content_type in ("photo","document"):
+            if msg.content_type=="photo":
+                file_id = msg.photo[-1].file_id
+                filename = f"{file_id}.jpg"
+                file_obj = await bot.get_file(file_id)
+                bts = await bot.download_file(file_obj.file_path)
+            else:
+                file_id = msg.document.file_id
+                filename = msg.document.file_name
+                file_obj = await bot.get_file(file_id)
+                bts = await bot.download_file(file_obj.file_path)
+            path = save_media_file(PROJECT_ID, bts, filename,
+                                   Path(__file__).parent.parent/"media")
+            update_helper_entry(PROJECT_ID, eid, media_path=path.name)
+        elif msg.text.lower()=="нет":
+            update_helper_entry(PROJECT_ID, eid, media_path="")
+        else:
+            return await msg.answer("Ожидался файл или `нет`.")
+    await msg.answer("✅ Паста обновлена.", reply_markup=build_menu())
+    await state.finish()
+
+# Delete paste
+@dp.callback_query_handler(lambda c: c.data=="del", state=AdminStates.in_menu)
+async def del_list(c, state: FSMContext):
+    ent = get_all_helper_entries(PROJECT_ID)
+    if not ent:
+        await c.answer("Пусто.")
+        return
+    kb = InlineKeyboardMarkup(row_width=1)
+    for e in ent:
+        kb.add(InlineKeyboardButton(f"🗑 /{e['alias']}", callback_data=f"del_{e['id']}"))
+    kb.add(InlineKeyboardButton("🔙 Назад", callback_data="admin_cancel"))
+    await c.message.edit_text("Выберите пасту для удаления:", reply_markup=kb)
+    await AdminStates.deleting_sel.set()
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("del_"), state=AdminStates.deleting_sel)
+async def del_confirm(c, state: FSMContext):
+    eid = int(c.data.split("_")[1])
+    await state.update_data(del_id=eid)
+    kb = InlineKeyboardMarkup().add(
+        InlineKeyboardButton("✅ Да", callback_data="yes"),
+        InlineKeyboardButton("❌ Нет", callback_data="no")
+    )
+    await c.message.edit_text(f"Удалить пасту #{eid}?", reply_markup=kb)
+    await AdminStates.confirming_del.set()
+
+@dp.callback_query_handler(lambda c: c.data in ("yes","no"), state=AdminStates.confirming_del)
+async def del_done(c, state: FSMContext):
+    if c.data=="yes":
+        delete_helper_entry(PROJECT_ID, (await state.get_data())["del_id"])
+        text="✅ Удалено."
+    else:
+        text="❌ Отмена."
+    await c.message.edit_text(text, reply_markup=build_menu())
+    await state.finish()
+
+# List pastes
+@dp.callback_query_handler(lambda c: c.data=="list", state=AdminStates.in_menu)
+async def list_pastes(c, state: FSMContext):
+    ent = get_all_helper_entries(PROJECT_ID)
+    text = "\n".join(f"/{e['alias']} — {e['content'][:50]}…" for e in ent) or "Пусто."
+    await c.message.edit_text(text, reply_markup=build_menu())
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data=="admin_cancel", state="*")
+async def cancel_any(c, state: FSMContext):
+    await state.finish()
+    await c.message.edit_text("🛠 Меню Helper-bot:", reply_markup=build_menu())
+    await c.answer()
+
+if __name__=="__main__":
+    executor.start_polling(dp, skip_updates=True)
