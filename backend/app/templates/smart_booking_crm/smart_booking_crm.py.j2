@@ -1,0 +1,661 @@
+{# templates/smart_booking_crm/bot.py.j2 #}
+#!/usr/bin/env python3
+import os
+from pathlib import Path
+from datetime import datetime, date, timedelta
+
+from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from openpyxl import Workbook, load_workbook
+
+from app.database import (
+    init_db,
+    # services
+    add_service, get_services, delete_service,
+    # work intervals
+    add_work_interval, get_work_intervals, delete_work_interval,
+    # panic exceptions
+    add_work_exception, activate_planned_exception, cancel_bookings_in_interval,
+    # bookings & users
+    create_booking_safe, set_order_status, get_order, ban_user, is_banned,
+    # reminders & summary
+    get_confirmed_future_bookings, get_planned_exceptions,
+    get_booking, get_bookings_by_date,
+    # export CRM
+    get_all_clients, get_all_bookings,
+    # settings
+    get_setting, set_setting
+)
+
+# — Environment & constants —
+load_dotenv()
+BOT_TOKEN     = os.getenv("TOKEN")
+ADMIN_CHAT    = {{ project.content.admin_chat_id }}
+PROJECT_ID    = {{ project.id }}
+SLOT_SIZE_MIN = {{ project.content.slot_size_minutes }}
+TZ            = os.getenv("TZ", "Europe/Bucharest")
+
+# — Bot, FSM, Scheduler —
+bot       = Bot(token=BOT_TOKEN)
+storage   = MemoryStorage()
+dp        = Dispatcher(bot, storage=storage)
+scheduler = AsyncIOScheduler(timezone=TZ)
+
+# — Initialize DB tables —
+init_db()
+
+# === FSM States ===
+class ClientStates(StatesGroup):
+    choosing_category = State()
+    choosing_service  = State()
+    choosing_date     = State()
+    choosing_time     = State()
+    waiting_details   = State()
+
+class AdminStates(StatesGroup):
+    in_menu                 = State()
+    # services CRUD
+    adding_service_name     = State()
+    adding_service_price    = State()
+    adding_service_duration = State()
+    adding_service_category = State()
+    deleting_service        = State()
+    # intervals CRUD
+    adding_slot_date        = State()
+    adding_slot_time        = State()
+    removing_slot           = State()
+    # schedule view
+    viewing_schedule        = State()
+    # panic
+    panic_now_duration      = State()
+    panic_later_date        = State()
+    panic_later_time        = State()
+    # notify config
+    config_notify_menu      = State()
+    config_summary_time     = State()
+    config_timezone         = State()
+
+# === UI Builders ===
+def build_admin_menu() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("➕ Добавить услугу",       callback_data="admin_add_service"),
+        InlineKeyboardButton("🗑 Удалить услугу",        callback_data="admin_del_service"),
+        InlineKeyboardButton("➕ Добавить окно",         callback_data="admin_add_slot"),
+        InlineKeyboardButton("➖ Удалить окно",          callback_data="admin_remove_slot"),
+        InlineKeyboardButton("📅 Расписание",           callback_data="admin_schedule"),
+        InlineKeyboardButton("⛔ Срочно закрыть",        callback_data="admin_panic_now"),
+        InlineKeyboardButton("⏳ Запланировать закрытие",callback_data="admin_panic_later"),
+        InlineKeyboardButton("⚙️ Настройка рассылки",   callback_data="admin_config_notify"),
+        InlineKeyboardButton("📆 Сегодня",              callback_data="admin_today"),
+        InlineKeyboardButton("📤 Экспорт CRM",          callback_data="admin_export")
+    )
+    return kb
+
+def build_date_calendar(days: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=4)
+    today = date.today()
+    for i in range(days):
+        d = today + timedelta(days=i)
+        kb.insert(InlineKeyboardButton(d.strftime("%d %b"), callback_data=f"date_{d.strftime('%Y%m%d')}"))
+    kb.add(InlineKeyboardButton("🔙 Главное меню", callback_data="admin_cancel"))
+    return kb
+
+def build_schedule_view(day: date, mode: str):
+    text = f"📅 Расписание на {day.strftime('%d.%m.%Y')}  (режим: {mode})\n\n"
+    kb = InlineKeyboardMarkup(row_width=4)
+    kb.row(
+        InlineKeyboardButton("⬅️", callback_data="sch_prev"),
+        InlineKeyboardButton("🔄 Режим", callback_data="sch_toggle"),
+        InlineKeyboardButton("➡️", callback_data="sch_next"),
+    )
+    start_dt = datetime.combine(day, datetime.min.time()).replace(hour=9)
+    end_dt   = start_dt.replace(hour=18)
+    cur = start_dt
+    while cur < end_dt:
+        key = cur.strftime("%Y%m%d_%H%M")
+        if is_slot_blocked(cur):
+            icon = "🟥"
+        elif is_slot_booked(cur):
+            icon = "🟦"
+        else:
+            icon = "⬜"
+        kb.insert(InlineKeyboardButton(icon, callback_data=f"slot_{key}"))
+        cur += timedelta(minutes=SLOT_SIZE_MIN)
+    kb.add(InlineKeyboardButton("🔙 Главное меню", callback_data="admin_cancel"))
+    return text, kb
+
+# === Reminders & Summary ===
+async def send_reminder(booking_id: int, label: str):
+    b = get_booking(booking_id)
+    if not b: return
+    dt = datetime.fromisoformat(b["start_dt"])
+    await bot.send_message(
+        b["user_id"],
+        f"⏰ Напоминание {label}: запись на «{b['service_name']}»\n"
+        f"{dt.strftime('%d.%m.%Y %H:%M')}."
+    )
+
+def schedule_booking_reminders(booking_id: int):
+    b = get_booking(booking_id)
+    dt = datetime.fromisoformat(b["start_dt"])
+    t1 = dt - timedelta(hours=24)
+    if t1 > datetime.utcnow():
+        scheduler.add_job(send_reminder, "date", run_date=t1, args=[booking_id, "за 24 ч"])
+    t2 = dt - timedelta(hours=2)
+    if t2 > datetime.utcnow():
+        scheduler.add_job(send_reminder, "date", run_date=t2, args=[booking_id, "за 2 ч"])
+
+def send_daily_summary():
+    if get_setting('summary_enabled') != 'true':
+        return
+    today_str = datetime.utcnow().date().isoformat()
+    rows = get_bookings_by_date(today_str, status="confirmed")
+    if rows:
+        lines = [
+            f"{datetime.fromisoformat(r['start_dt']).strftime('%H:%M')} — "
+            f"{r['service_name']} ({r['client_name']})"
+            for r in rows
+        ]
+        text = "📆 Сводка на сегодня:\n" + "\n".join(lines)
+    else:
+        text = "🙌 Сегодня нет подтверждённых записей."
+    bot.loop.create_task(bot.send_message(ADMIN_CHAT, text))
+
+def schedule_daily_summary_job():
+    try:
+        scheduler.remove_job('daily_summary')
+    except:
+        pass
+    if get_setting('summary_enabled') != 'true':
+        return
+    h, m = map(int, get_setting('summary_time').split(":"))
+    tz = get_setting('summary_timezone')
+    scheduler.add_job(
+        send_daily_summary, 'cron', hour=h, minute=m,
+        timezone=tz, id='daily_summary'
+    )
+
+def restore_tasks():
+    for b in get_confirmed_future_bookings():
+        schedule_booking_reminders(b["id"])
+    for ex in get_planned_exceptions():
+        dt = datetime.fromisoformat(ex["start_dt"])
+        if dt > datetime.utcnow():
+            scheduler.add_job(
+                activate_planned_exception, "date",
+                run_date=dt, args=[ex["id"]]
+            )
+
+# === Client Handlers ===
+
+@dp.message_handler(commands=['start'])
+async def send_welcome(msg: types.Message):
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    kb.add("📝 Записаться")
+    await msg.answer("Нажмите кнопку, чтобы начать запись", reply_markup=kb)
+
+@dp.message_handler(lambda m: m.text=="📝 Записаться")
+async def start_booking(msg: types.Message):
+    if is_banned(msg.from_user.id):
+        return await msg.answer("🚫 Вы заблокированы")
+    cats = sorted({s["category"] for s in get_services()})
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for c in cats: kb.add(c)
+    kb.add("Отмена")
+    await msg.answer("Выберите категорию:", reply_markup=kb)
+    await ClientStates.choosing_category.set()
+
+@dp.message_handler(state=ClientStates.choosing_category)
+async def choose_category(msg: types.Message, state: FSMContext):
+    if msg.text=="Отмена":
+        await state.finish()
+        return await msg.answer("Отменено", reply_markup=ReplyKeyboardRemove())
+    services = [s for s in get_services() if s["category"]==msg.text]
+    if not services:
+        return await msg.answer("Выберите из списка.")
+    await state.update_data(category=msg.text)
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    for s in services:
+        kb.add(f"{s['name']} — {s['price']}₽ / {s['duration_cells']}×{SLOT_SIZE_MIN}м")
+    kb.add("Назад","Отмена")
+    await msg.answer("Выберите услугу:", reply_markup=kb)
+    await ClientStates.choosing_service.set()
+
+@dp.message_handler(state=ClientStates.choosing_service)
+async def choose_service(msg: types.Message, state: FSMContext):
+    if msg.text in ("Отмена","Назад"):
+        return await start_booking(msg) if msg.text=="Назад" else await state.finish()
+    name = msg.text.split(" — ")[0]
+    svc = next((s for s in get_services() if s["name"]==name), None)
+    if not svc:
+        return await msg.answer("Выберите из списка.")
+    await state.update_data(
+        service_id=svc["id"], service_name=svc["name"], duration_cells=svc["duration_cells"]
+    )
+    await msg.answer("Выберите дату:", reply_markup=build_date_calendar(7))
+    await ClientStates.choosing_date.set()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("date_"), state=ClientStates.choosing_date)
+async def choose_date(c: types.CallbackQuery, state: FSMContext):
+    ds = c.data.split("_",1)[1]
+    await state.update_data(chosen_date=ds)
+    data = await state.get_data()
+    slots = find_free_slots(PROJECT_ID, ds, data["duration_cells"])
+    if not slots:
+        return await c.answer("Нет свободных слотов", show_alert=True)
+    kb = InlineKeyboardMarkup(row_width=3)
+    for sl in slots:
+        t = sl.split("_")[1]
+        kb.insert(InlineKeyboardButton(t, callback_data=f"slot_{sl}"))
+    await c.message.edit_text("Свободные слоты:", reply_markup=kb)
+    await ClientStates.choosing_time.set()
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("slot_"), state=ClientStates.choosing_time)
+async def choose_time(c: types.CallbackQuery, state: FSMContext):
+    sl = c.data.split("_",1)[1]
+    dt = datetime.strptime(sl, "%Y%m%d_%H%M")
+    await state.update_data(chosen_datetime=dt.isoformat())
+    await bot.send_message(
+        c.from_user.id,
+        f"Выбрано {dt.strftime('%d.%m.%Y %H:%M')}\nВведите имя и телефон:",
+        reply_markup=types.ReplyKeyboardMarkup().add("Отмена")
+    )
+    await ClientStates.waiting_details.set()
+    await c.answer()
+
+@dp.message_handler(state=ClientStates.waiting_details)
+async def enter_details(msg: types.Message, state: FSMContext):
+    if msg.text=="Отмена":
+        await state.finish()
+        return await msg.answer("Отменено", reply_markup=ReplyKeyboardRemove())
+    try:
+        name, phone = msg.text.rsplit(" ",1)
+    except:
+        return await msg.answer("Формат: Имя Телефон")
+    data = await state.get_data()
+    try:
+        bid = create_booking_safe(
+            msg.from_user.id,
+            data["service_id"],
+            data["chosen_datetime"],
+            data["duration_cells"],
+            name, phone
+        )
+    except Exception as e:
+        await msg.answer(f"❗ {e}")
+        return await state.finish()
+    await msg.answer(f"✅ Заказ #{bid} создан!", reply_markup=ReplyKeyboardRemove())
+    schedule_booking_reminders(bid)
+    await bot.send_message(
+        ADMIN_CHAT,
+        f"📦 Новый заказ #{bid}\n"
+        f"Услуга: {data['service_name']}\n"
+        f"Дата: {data['chosen_datetime']}\n"
+        f"Клиент: {name}, {phone}"
+    )
+    await state.finish()
+
+# === Admin: Reschedule ===
+@dp.callback_query_handler(lambda c: c.data.startswith("reschedule_"))
+async def client_reschedule(c: types.CallbackQuery, state: FSMContext):
+    bid = int(c.data.split("_",1)[1])
+    o = get_order(bid)
+    if not o:
+        return await c.answer("Заказ не найден", show_alert=True)
+    await state.update_data(
+        service_id=o["service_id"],
+        duration_cells=o["duration_cells"]
+    )
+    await c.message.edit_text("Выберите новую дату:", reply_markup=build_date_calendar(7))
+    await ClientStates.choosing_date.set()
+    await c.answer()
+
+# === Admin Menu & Handlers ===
+@dp.message_handler(lambda m: m.chat.id==ADMIN_CHAT, content_types=types.ContentTypes.TEXT)
+async def show_admin_menu(msg: types.Message):
+    await msg.answer("🛠 Главное меню:", reply_markup=build_admin_menu())
+    await AdminStates.in_menu.set()
+
+@dp.callback_query_handler(lambda c: c.data=="admin_cancel", state="*")
+async def cancel_any(c: types.CallbackQuery, state: FSMContext):
+    await state.finish()
+    await c.message.edit_text("❎ Операция отменена.\n\n🛠 Главное меню:", reply_markup=build_admin_menu())
+    await c.answer()
+
+# -- CRUD Services --
+@dp.callback_query_handler(lambda c: c.data=="admin_add_service", state=AdminStates.in_menu)
+async def admin_add_start(c: types.CallbackQuery):
+    await c.message.edit_text("📝 Введите название услуги:")
+    await AdminStates.adding_service_name.set()
+    await c.answer()
+
+@dp.message_handler(state=AdminStates.adding_service_name, lambda m: m.chat.id==ADMIN_CHAT)
+async def admin_add_name(msg: types.Message, state: FSMContext):
+    await state.update_data(name=msg.text.strip())
+    await msg.answer("💰 Укажите цену (целое число):")
+    await AdminStates.adding_service_price.set()
+
+@dp.message_handler(state=AdminStates.adding_service_price, lambda m: m.chat.id==ADMIN_CHAT)
+async def admin_add_price(msg: types.Message, state: FSMContext):
+    if not msg.text.isdigit():
+        return await msg.answer("❗ Введите число.")
+    await state.update_data(price=int(msg.text))
+    await msg.answer(f"⏱ Длительность в минутах (кратна {SLOT_SIZE_MIN}):")
+    await AdminStates.adding_service_duration.set()
+
+@dp.message_handler(state=AdminStates.adding_service_duration, lambda m: m.chat.id==ADMIN_CHAT)
+async def admin_add_duration(msg: types.Message, state: FSMContext):
+    if not msg.text.isdigit() or int(msg.text)%SLOT_SIZE_MIN!=0:
+        return await msg.answer(f"❗ Кратность {SLOT_SIZE_MIN}.")
+    await state.update_data(duration_cells=int(msg.text)//SLOT_SIZE_MIN)
+    await msg.answer("📂 Категория (или «—»):")
+    await AdminStates.adding_service_category.set()
+
+@dp.message_handler(state=AdminStates.adding_service_category, lambda m: m.chat.id==ADMIN_CHAT)
+async def admin_add_category(msg: types.Message, state: FSMContext):
+    cat = msg.text.strip()
+    if cat=="—": cat="Общее"
+    data = await state.get_data()
+    sid = add_service(data['name'], cat, data['price'], data['duration_cells'])
+    await msg.answer(f"✅ Услуга #{sid} добавлена.", reply_markup=build_admin_menu())
+    await state.finish()
+
+@dp.callback_query_handler(lambda c: c.data=="admin_del_service", state=AdminStates.in_menu)
+async def admin_del_list(c: types.CallbackQuery):
+    svs = get_services()
+    kb = InlineKeyboardMarkup(row_width=1)
+    for s in svs:
+        kb.add(InlineKeyboardButton(f"❌ {s['id']}. {s['name']}", callback_data=f"delsvc_{s['id']}"))
+    kb.add(InlineKeyboardButton("🔙 Главное меню", callback_data="admin_cancel"))
+    await c.message.edit_text("Выберите для удаления:", reply_markup=kb)
+    await AdminStates.deleting_service.set()
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("delsvc_"), state=AdminStates.deleting_service)
+async def admin_del_confirm(c: types.CallbackQuery, state: FSMContext):
+    sid = int(c.data.split("_",1)[1])
+    await state.update_data(del_id=sid)
+    kb = InlineKeyboardMarkup().add(
+        InlineKeyboardButton("✅ Да", callback_data="del_yes"),
+        InlineKeyboardButton("❌ Нет", callback_data="del_no")
+    )
+    s = next(s for s in get_services() if s['id']==sid)
+    await c.message.edit_text(f"Удалить «{s['name']}»?", reply_markup=kb)
+    await AdminStates.deleting_service.set()
+
+@dp.callback_query_handler(lambda c: c.data in ["del_yes","del_no"], state=AdminStates.deleting_service)
+async def admin_del_done(c: types.CallbackQuery, state: FSMContext):
+    if c.data=="del_yes":
+        sid = (await state.get_data())['del_id']
+        delete_service(sid)
+        text = f"✅ Услуга #{sid} удалена."
+    else:
+        text = "❌ Отмена."
+    await c.message.edit_text(text, reply_markup=build_admin_menu())
+    await state.finish()
+    await c.answer()
+
+# -- CRUD Intervals --
+@dp.callback_query_handler(lambda c: c.data=="admin_add_slot", state=AdminStates.in_menu)
+async def admin_add_slot_start(c: types.CallbackQuery):
+    await c.message.edit_text("📅 Выберите дату для окна:", reply_markup=build_date_calendar(14))
+    await AdminStates.adding_slot_date.set()
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("date_"), state=AdminStates.adding_slot_date)
+async def admin_add_slot_date(c: types.CallbackQuery, state: FSMContext):
+    ds = c.data.split("_",1)[1]
+    await state.update_data(slot_date=ds)
+    await c.message.edit_text("⏱ Введите интервал HH:MM-HH:MM:")
+    await AdminStates.adding_slot_time.set()
+    await c.answer()
+
+@dp.message_handler(state=AdminStates.adding_slot_time, lambda m: m.chat.id==ADMIN_CHAT)
+async def admin_add_slot_time(msg: types.Message, state: FSMContext):
+    txt = msg.text.strip()
+    try:
+        start,end = txt.split("-")
+        ds = (await state.get_data())["slot_date"]
+        start_iso = f"{ds}T{start}"
+        end_iso   = f"{ds}T{end}"
+        add_work_interval(PROJECT_ID, start_iso, end_iso)
+        await msg.answer(f"✅ Окно {ds} {txt} добавлено.", reply_markup=build_admin_menu())
+    except:
+        await msg.answer("❗ Формат HH:MM-HH:MM.")
+    await state.finish()
+
+@dp.callback_query_handler(lambda c: c.data=="admin_remove_slot", state=AdminStates.in_menu)
+async def admin_remove_slot_list(c: types.CallbackQuery):
+    ivs = get_work_intervals(PROJECT_ID, 30)
+    kb = InlineKeyboardMarkup(row_width=1)
+    for iv in ivs:
+        kb.add(InlineKeyboardButton(f"{iv['id']}. {iv['start_dt']}–{iv['end_dt']}",
+                                    callback_data=f"rmslot_{iv['id']}"))
+    kb.add(InlineKeyboardButton("🔙 Главное меню", callback_data="admin_cancel"))
+    await c.message.edit_text("Удалить окно:", reply_markup=kb)
+    await AdminStates.removing_slot.set()
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("rmslot_"), state=AdminStates.removing_slot)
+async def admin_remove_slot_confirm(c: types.CallbackQuery, state: FSMContext):
+    iid = int(c.data.split("_",1)[1])
+    await state.update_data(rem_id=iid)
+    kb = InlineKeyboardMarkup().add(
+        InlineKeyboardButton("✅ Да", callback_data="rmslot_yes"),
+        InlineKeyboardButton("❌ Нет", callback_data="rmslot_no")
+    )
+    await c.message.edit_text(f"Удалить окно #{iid}?", reply_markup=kb)
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data in ["rmslot_yes","rmslot_no"], state=AdminStates.removing_slot)
+async def admin_remove_slot_done(c: types.CallbackQuery, state: FSMContext):
+    if c.data=="rmslot_yes":
+        iid = (await state.get_data())['rem_id']
+        delete_work_interval(iid)
+        text = f"✅ Окно #{iid} удалено."
+    else:
+        text = "❌ Отмена."
+    await c.message.edit_text(text, reply_markup=build_admin_menu())
+    await state.finish()
+    await c.answer()
+
+# -- Schedule View --
+@dp.callback_query_handler(lambda c: c.data=="admin_schedule", state=AdminStates.in_menu)
+async def admin_schedule_start(c: types.CallbackQuery, state: FSMContext):
+    today = date.today()
+    await state.update_data(schedule_date=today, schedule_mode="busy")
+    txt, kb = build_schedule_view(today, "busy")
+    await c.message.edit_text(txt, reply_markup=kb)
+    await AdminStates.viewing_schedule.set()
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data in ["sch_prev","sch_next"], state=AdminStates.viewing_schedule)
+async def admin_schedule_nav(c: types.CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    day = d["schedule_date"]
+    new = day - timedelta(days=1) if c.data=="sch_prev" else day + timedelta(days=1)
+    await state.update_data(schedule_date=new)
+    txt, kb = build_schedule_view(new, d["schedule_mode"])
+    await c.message.edit_text(txt, reply_markup=kb)
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data=="sch_toggle", state=AdminStates.viewing_schedule)
+async def admin_schedule_toggle(c: types.CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    modes = ["busy","free","panic"]
+    idx = modes.index(d["schedule_mode"])
+    new = modes[(idx+1)%3]
+    await state.update_data(schedule_mode=new)
+    txt, kb = build_schedule_view(d["schedule_date"], new)
+    await c.message.edit_text(txt, reply_markup=kb)
+    await c.answer(f"Режим: {new}")
+
+@dp.callback_query_handler(lambda c: c.data.startswith("slot_"), state=AdminStates.viewing_schedule)
+async def admin_schedule_slot(c: types.CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    mode = d["schedule_mode"]
+    dt = datetime.strptime(c.data.split("_",1)[1], "%Y%m%d_%H%M")
+    if mode=="busy":
+        toggle_booking(dt)
+    elif mode=="free":
+        toggle_booking(dt)
+    else:
+        toggle_block(dt)
+    txt, kb = build_schedule_view(d["schedule_date"], mode)
+    await c.message.edit_text(txt, reply_markup=kb)
+    await c.answer()
+
+# -- Panic Now --
+@dp.callback_query_handler(lambda c: c.data=="admin_panic_now", state=AdminStates.in_menu)
+async def panic_now_start(c: types.CallbackQuery):
+    await c.message.edit_text("⛔ Введите длительность экстренной отмены в часах:")
+    await AdminStates.panic_now_duration.set()
+    await c.answer()
+
+@dp.message_handler(state=AdminStates.panic_now_duration, lambda m: m.chat.id==ADMIN_CHAT)
+async def panic_now_duration(msg: types.Message, state: FSMContext):
+    if not msg.text.isdigit():
+        return await msg.answer("❗ Введите число.")
+    hrs = int(msg.text)
+    now = datetime.utcnow()
+    end = now + timedelta(hours=hrs)
+    ex_id = add_work_exception(PROJECT_ID, now.isoformat(), end.isoformat(), "active")
+    canceled = cancel_bookings_in_interval(now.isoformat(), end.isoformat())
+    for b in canceled:
+        await bot.send_message(b["user_id"], f"⚠️ Заказ #{b['id']} отменён.")
+    await msg.answer(f"✅ Паника на {hrs} ч активирована.", reply_markup=build_admin_menu())
+    await state.finish()
+
+# -- Panic Later --
+@dp.callback_query_handler(lambda c: c.data=="admin_panic_later", state=AdminStates.in_menu)
+async def panic_later_start(c: types.CallbackQuery):
+    await c.message.edit_text("⏳ Выберите дату для плановой отмены:", reply_markup=build_date_calendar(14))
+    await AdminStates.panic_later_date.set()
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("date_"), state=AdminStates.panic_later_date)
+async def panic_later_date(c: types.CallbackQuery, state: FSMContext):
+    ds = c.data.split("_",1)[1]
+    await state.update_data(panic_date=ds)
+    await c.message.edit_text("⏱ Введите интервал HH:MM-HH:MM:")
+    await AdminStates.panic_later_time.set()
+    await c.answer()
+
+@dp.message_handler(state=AdminStates.panic_later_time, lambda m: m.chat.id==ADMIN_CHAT)
+async def panic_later_time(msg: types.Message, state: FSMContext):
+    try:
+        start,end = msg.text.strip().split("-")
+        ds = (await state.get_data())["panic_date"]
+        s_iso = f"{ds}T{start}"
+        e_iso = f"{ds}T{end}"
+        ex_id = add_work_exception(PROJECT_ID, s_iso, e_iso, "planned")
+        run_dt = datetime.fromisoformat(s_iso)
+        scheduler.add_job(activate_planned_exception, "date", run_date=run_dt, args=[ex_id])
+        await msg.answer("⏳ Плановая паника запланирована.", reply_markup=build_admin_menu())
+    except:
+        await msg.answer("❗ Формат HH:MM-HH:MM.")
+    await state.finish()
+
+# -- Notify Config --
+@dp.callback_query_handler(lambda c: c.data=="admin_config_notify", state=AdminStates.in_menu)
+async def cfg_notify_menu(c: types.CallbackQuery):
+    en = get_setting('summary_enabled')=='true'
+    tm = get_setting('summary_time')
+    tz = get_setting('summary_timezone')
+    text = f"🛠 Сводка:\nВкл: {'✅' if en else '❌'}\nВремя: {tm}\nTZ: {tz}"
+    kb = InlineKeyboardMarkup(row_width=1).add(
+        InlineKeyboardButton("🔁 Вкл/Выкл", callback_data="cfg_toggle_enable"),
+        InlineKeyboardButton("⏰ Время",     callback_data="cfg_set_time"),
+        InlineKeyboardButton("🌐 Часовой пояс", callback_data="cfg_set_tz"),
+        InlineKeyboardButton("🔙 Главное меню", callback_data="admin_cancel")
+    )
+    await c.message.edit_text(text, reply_markup=kb)
+    await AdminStates.config_notify_menu.set()
+    await c.answer()
+
+@dp.callback_query_handler(lambda c: c.data=="cfg_toggle_enable", state=AdminStates.config_notify_menu)
+async def cfg_toggle_enable(c: types.CallbackQuery):
+    cur = get_setting('summary_enabled')=='true'
+    set_setting('summary_enabled', 'false' if cur else 'true')
+    schedule_daily_summary_job()
+    await c.answer("Готово")
+    return await cfg_notify_menu(c)
+
+@dp.callback_query_handler(lambda c: c.data=="cfg_set_time", state=AdminStates.config_notify_menu)
+async def cfg_set_time_prompt(c: types.CallbackQuery):
+    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Назад", callback_data="admin_config_notify"))
+    await c.message.edit_text("Введите HH:MM:", reply_markup=kb)
+    await AdminStates.config_summary_time.set()
+    await c.answer()
+
+@dp.message_handler(state=AdminStates.config_summary_time, lambda m: m.chat.id==ADMIN_CHAT)
+async def cfg_set_time_apply(msg: types.Message, state: FSMContext):
+    try:
+        h,m = map(int, msg.text.strip().split(":"))
+        assert 0<=h<24 and 0<=m<60
+        set_setting('summary_time', f"{h:02d}:{m:02d}")
+        schedule_daily_summary_job()
+        await msg.answer("⏰ Время обновлено", reply_markup=build_admin_menu())
+    except:
+        await msg.answer("❗ Формат HH:MM")
+    await state.finish()
+
+@dp.callback_query_handler(lambda c: c.data=="cfg_set_tz", state=AdminStates.config_notify_menu)
+async def cfg_set_tz_prompt(c: types.CallbackQuery):
+    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Назад", callback_data="admin_config_notify"))
+    await c.message.edit_text("Введите IANA часовой пояс:", reply_markup=kb)
+    await AdminStates.config_timezone.set()
+    await c.answer()
+
+@dp.message_handler(state=AdminStates.config_timezone, lambda m: m.chat.id==ADMIN_CHAT)
+async def cfg_set_tz_apply(msg: types.Message, state: FSMContext):
+    set_setting('summary_timezone', msg.text.strip())
+    schedule_daily_summary_job()
+    await msg.answer("🌐 TZ обновлён", reply_markup=build_admin_menu())
+    await state.finish()
+
+# -- Today manual summary --
+@dp.callback_query_handler(lambda c: c.data=="admin_today", state=AdminStates.in_menu)
+async def admin_today(c: types.CallbackQuery):
+    send_daily_summary()
+    await c.answer("Сводка отправлена")
+
+# -- Export CRM --
+@dp.callback_query_handler(lambda c: c.data=="admin_export", state=AdminStates.in_menu)
+async def admin_export(c: types.CallbackQuery):
+    wb = Workbook()
+    ws1 = wb.active; ws1.title="Clients"
+    ws1.append(["user_id","name","phone"])
+    for cl in get_all_clients():
+        ws1.append([cl["user_id"], cl["name"], cl["phone"]])
+    ws2 = wb.create_sheet("Bookings")
+    ws2.append(["id","service","start_dt","client","status"])
+    for b in get_all_bookings():
+        ws2.append([b["id"], b["service_name"], b["start_dt"], b["client_name"], b["status"]])
+    bio = BytesIO(); wb.save(bio); bio.seek(0)
+    await bot.send_document(ADMIN_CHAT, bio, filename="crm_export.xlsx")
+    await c.answer("Экспорт готов")
+
+# -- Help Commands --
+@dp.message_handler(commands=['help'])
+async def help_user(msg: types.Message):
+    await msg.answer("ℹ️ Нажмите «📝 Записаться» для заказа.")
+
+@dp.message_handler(commands=['adminhelp'])
+async def help_admin(msg: types.Message):
+    if msg.chat.id==ADMIN_CHAT:
+        await show_admin_menu(msg)
+
+# === Startup ===
+if __name__ == '__main__':
+    restore_tasks()
+    schedule_daily_summary_job()
+    scheduler.start()
+    executor.start_polling(dp, skip_updates=True)

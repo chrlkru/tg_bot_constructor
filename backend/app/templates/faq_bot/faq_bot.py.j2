@@ -1,3 +1,4 @@
+# templates/faq_bot/bot.py.j2
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
@@ -54,8 +55,8 @@ def add_entry(question, answer, media_path):
         "INSERT INTO faq_entries (project_id,question,answer,media_path) VALUES (?,?,?,?)",
         (PROJECT_ID, question, answer, media_path or "")
     )
-    conn.commit()
     eid = cur.lastrowid
+    conn.commit()
     conn.close()
     return eid
 
@@ -73,51 +74,187 @@ def delete_entry(entry_id):
 class FAQState(StatesGroup):
     waiting_for_choice = State()
 
-class AdminAddFAQ(StatesGroup):
-    waiting_for_question = State()
-    waiting_for_answer   = State()
-    waiting_for_media    = State()
+class AdminStates(StatesGroup):
+    in_menu                = State()
+    adding_question        = State()
+    adding_answer          = State()
+    adding_media           = State()
+    deleting_selection     = State()
+    deleting_confirmation  = State()
 
-class AdminDelFAQ(StatesGroup):
-    waiting_for_selection = State()
-    waiting_for_confirm   = State()
-
-# — Утилита: форматируем список вопросов —
+# — Утилиты —
 def format_questions(entries):
     text = "📖 FAQ — Список вопросов:\n\n"
     for idx, e in enumerate(entries, start=1):
         text += f"{idx}. {e['question']}\n"
-    text += "\nВведите номер для ответа."
     return text
+
+def build_admin_menu():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("➕ Добавить FAQ", callback_data="admin_add_faq"),
+        types.InlineKeyboardButton("🗑 Удалить FAQ", callback_data="admin_del_faq")
+    )
+    return kb
+
+# === /help и /adminhelp ===
+
+@dp.message_handler(commands=['help'])
+async def user_help(msg: types.Message):
+    await msg.answer(
+        "ℹ️ Введите /faq или нажмите кнопку «Список вопросов», "
+        "чтобы увидеть возможные вопросы и получить ответ."
+    )
+
+@dp.message_handler(commands=['adminhelp'])
+async def admin_help(msg: types.Message):
+    if msg.chat.id != ADMIN_CHAT:
+        return
+    await msg.answer(
+        "🛠 Админ-меню FAQ:\n"
+        "— ➕ Добавить FAQ: добавить новый вопрос/ответ/медиа\n"
+        "— 🗑 Удалить FAQ: удалить существующий вопрос\n\n"
+        "Нажмите любую кнопку, чтобы открыть меню."
+    )
+
+# === Фоллбек ===
+
+@dp.message_handler(state="*")
+async def fallback(msg: types.Message):
+    if msg.chat.id == ADMIN_CHAT:
+        # админ: показать меню
+        await msg.answer("🛠 Главное меню FAQ:", reply_markup=build_admin_menu())
+    else:
+        # пользователь: подсказка
+        await msg.answer("❓ Нажмите /faq или кнопку «Список вопросов».")
+
+# === Админ-меню через кнопки ===
+
+@dp.message_handler(lambda m: m.chat.id==ADMIN_CHAT, content_types=types.ContentTypes.TEXT)
+async def show_admin_menu(msg: types.Message):
+    await msg.answer("🛠 Главное меню FAQ:", reply_markup=build_admin_menu())
+    await AdminStates.in_menu.set()
+
+@dp.callback_query_handler(lambda c: c.data=="admin_cancel", state="*")
+async def admin_cancel(c: types.CallbackQuery, state: FSMContext):
+    await state.finish()
+    await c.message.edit_text("❎ Операция отменена.\n\n🛠 Главное меню FAQ:", reply_markup=build_admin_menu())
+    await c.answer()
+
+# === Добавление FAQ ===
+
+@dp.callback_query_handler(lambda c: c.data=="admin_add_faq", state=AdminStates.in_menu)
+async def admin_add_start(c: types.CallbackQuery):
+    await c.message.edit_text("➕ Введите текст **вопроса**:")
+    await AdminStates.adding_question.set()
+    await c.answer()
+
+@dp.message_handler(state=AdminStates.adding_question, lambda m: m.chat.id==ADMIN_CHAT)
+async def admin_add_q(msg: types.Message, state: FSMContext):
+    await state.update_data(question=msg.text.strip())
+    await msg.answer("✏️ Введите текст **ответа**:")
+    await AdminStates.adding_answer.set()
+
+@dp.message_handler(state=AdminStates.adding_answer, lambda m: m.chat.id==ADMIN_CHAT)
+async def admin_add_a(msg: types.Message, state: FSMContext):
+    await state.update_data(answer=msg.text.strip())
+    await msg.answer("📷 Прикрепите медиа-файл или введите «нет»:")
+    await AdminStates.adding_media.set()
+
+@dp.message_handler(state=AdminStates.adding_media, lambda m: m.chat.id==ADMIN_CHAT, content_types=types.ContentTypes.ANY)
+async def admin_add_m(msg: types.Message, state: FSMContext):
+    data = await state.get_data()
+    media = ""
+    if msg.content_type in ['photo','document']:
+        saved = await msg.document.download(destination_dir=f"media/{PROJECT_ID}")
+        media = saved.name
+    elif msg.text.strip().lower() != 'нет':
+        await msg.answer("❗ Ожидался файл или «нет». Отмена.")
+        return await state.finish()
+    eid = add_entry(data['question'], data['answer'], media)
+    await msg.answer(f"✅ FAQ #{eid} добавлен.", reply_markup=build_admin_menu())
+    await state.finish()
+
+# === Удаление FAQ ===
+
+@dp.callback_query_handler(lambda c: c.data=="admin_del_faq", state=AdminStates.in_menu)
+async def admin_del_list(c: types.CallbackQuery):
+    entries = get_entries()
+    if not entries:
+        await c.message.edit_text("❌ FAQ пуст.", reply_markup=build_admin_menu())
+        return await c.answer()
+    text = format_questions(entries) + "\n\nВведите номер для удаления:"
+    await c.message.edit_text(text)
+    await AdminStates.deleting_selection.set()
+    await c.answer()
+
+@dp.message_handler(state=AdminStates.deleting_selection, lambda m: m.chat.id==ADMIN_CHAT)
+async def admin_del_select(msg: types.Message, state: FSMContext):
+    if not msg.text.isdigit():
+        return await msg.answer("❗ Введите номер вопроса для удаления.")
+    idx = int(msg.text.strip())
+    entries = get_entries()
+    if idx<1 or idx>len(entries):
+        return await msg.answer("❗ Неверный номер.")
+    e = entries[idx-1]
+    await state.update_data(del_id=e['id'])
+    kb = types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton("✅ Да", callback_data="del_confirm"),
+        types.InlineKeyboardButton("❌ Нет", callback_data="del_cancel")
+    )
+    await msg.answer(f"Удалить FAQ #{e['id']} «{e['question']}»?", reply_markup=kb)
+    await AdminStates.deleting_confirmation.set()
+
+@dp.callback_query_handler(lambda c: c.data in ['del_confirm','del_cancel'], state=AdminStates.deleting_confirmation)
+async def admin_del_confirm(c: types.CallbackQuery, state: FSMContext):
+    if c.data=='del_confirm':
+        eid = (await state.get_data())['del_id']
+        delete_entry(eid)
+        await c.message.edit_text(f"✅ FAQ #{eid} удалён.", reply_markup=build_admin_menu())
+    else:
+        await c.message.edit_text("❌ Удаление отменено.", reply_markup=build_admin_menu())
+    await state.finish()
+    await c.answer()
 
 # === Пользовательский режим ===
 
-@dp.message_handler(lambda m: m.chat.id != ADMIN_CHAT, commands=['start','faq'])
+@dp.message_handler(lambda m: m.chat.id != ADMIN_CHAT, commands=['faq'])
 async def cmd_faq(message: types.Message):
     entries = get_entries()
     if not entries:
         return await message.answer("❌ В FAQ пока нет записей.")
-    await message.answer(
-        format_questions(entries),
-        reply_markup=types.ReplyKeyboardRemove()
+    text = format_questions(entries)
+    kb = types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton("🔄 Список вопросов", callback_data="faq_list")
     )
+    await message.answer(text, reply_markup=kb)
     await FAQState.waiting_for_choice.set()
+
+@dp.callback_query_handler(lambda c: c.data=="faq_list", state="*")
+async def faq_list(c: types.CallbackQuery):
+    entries = get_entries()
+    if not entries:
+        return await c.answer("❌ FAQ пуст.", show_alert=True)
+    text = format_questions(entries)
+    kb = types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton("🔄 Список вопросов", callback_data="faq_list")
+    )
+    await c.message.edit_text(text, reply_markup=kb)
+    await c.answer()
 
 @dp.message_handler(lambda m: m.chat.id != ADMIN_CHAT, state=FAQState.waiting_for_choice)
 async def process_choice(message: types.Message, state: FSMContext):
-    text = message.text.strip().lower()
-    # повтор списка
-    if text in ['список','список вопросов']:
-        return await message.answer(format_questions(get_entries()))
-    # номер
+    text = message.text.strip()
+    if text.lower() in ['список','список вопросов']:
+        return await faq_list(types.CallbackQuery(
+            id=None, from_user=message.from_user, data="faq_list", message=message))
     if not text.isdigit():
         return await message.answer("❗ Введите номер вопроса.")
     idx = int(text)
     entries = get_entries()
-    if idx < 1 or idx > len(entries):
+    if idx<1 or idx>len(entries):
         return await message.answer("❗ Неверный номер.")
     e = entries[idx-1]
-    # отправка ответа и медиа
     if e['media']:
         path = Path(__file__).parent.parent / "media" / str(PROJECT_ID) / e['media']
         if path.exists():
@@ -126,97 +263,12 @@ async def process_choice(message: types.Message, state: FSMContext):
             await message.answer(e['answer'])
     else:
         await message.answer(e['answer'])
-    # кнопка «Список вопросов»
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    kb.add("Список вопросов")
-    await message.answer(
-        "Чтобы снова увидеть список, нажмите кнопку.",
-        reply_markup=kb
-    )
-    await state.finish()
-
-# === Админ: добавить новую запись ===
-
-@dp.message_handler(lambda m: m.chat.id == ADMIN_CHAT, commands=['addfaq'])
-async def cmd_addfaq(msg: types.Message):
-    await msg.answer("🆕 Введите текст **вопроса**:")
-    await AdminAddFAQ.waiting_for_question.set()
-
-@dp.message_handler(state=AdminAddFAQ.waiting_for_question, lambda m: m.chat.id == ADMIN_CHAT)
-async def faq_q(msg: types.Message, state: FSMContext):
-    q = msg.text.strip()
-    if not q:
-        await msg.answer("❗ Вопрос не может быть пустым. Отмена.")
-        return await state.finish()
-    await state.update_data(question=q)
-    await msg.answer("✏️ Введите текст **ответа**:")
-    await AdminAddFAQ.waiting_for_answer.set()
-
-@dp.message_handler(state=AdminAddFAQ.waiting_for_answer, lambda m: m.chat.id == ADMIN_CHAT)
-async def faq_a(msg: types.Message, state: FSMContext):
-    a = msg.text.strip()
-    if not a:
-        await msg.answer("❗ Ответ не может быть пустым. Отмена.")
-        return await state.finish()
-    await state.update_data(answer=a)
-    await msg.answer("📷 Прикрепите файл или напишите «нет»:")
-    await AdminAddFAQ.waiting_for_media.set()
-
-@dp.message_handler(state=AdminAddFAQ.waiting_for_media, content_types=types.ContentTypes.ANY,
-                    lambda m: m.chat.id == ADMIN_CHAT)
-async def faq_m(msg: types.Message, state: FSMContext):
-    data = await state.get_data()
-    media = ""
-    if msg.content_type in ['photo','document']:
-        saved = await msg.document.download(destination_dir=f"media/{PROJECT_ID}")
-        media = saved.name
-    elif msg.text.strip().lower() != 'нет':
-        await msg.answer("❗ Нужно файл или «нет». Отмена.")
-        return await state.finish()
-    eid = add_entry(data['question'], data['answer'], media)
-    await msg.answer(f"✅ FAQ #{eid} добавлен.")
-    await state.finish()
-
-# === Админ: удалить запись ===
-
-@dp.message_handler(lambda m: m.chat.id == ADMIN_CHAT, commands=['delfaq'])
-async def cmd_delfaq(msg: types.Message):
-    entries = get_entries()
-    if not entries:
-        return await msg.answer("❌ FAQ пуст.")
-    await msg.answer(format_questions(entries))
-    await msg.answer("Введите номер FAQ для удаления:")
-    await AdminDelFAQ.waiting_for_selection.set()
-
-@dp.message_handler(state=AdminDelFAQ.waiting_for_selection, lambda m: m.chat.id == ADMIN_CHAT)
-async def faq_del_select(msg: types.Message, state: FSMContext):
-    text = msg.text.strip()
-    if not text.isdigit():
-        return await msg.answer("❗ Введите номер.")
-    idx = int(text)
-    entries = get_entries()
-    if idx < 1 or idx > len(entries):
-        return await msg.answer("❗ Неверный номер.")
-    e = entries[idx-1]
-    await state.update_data(del_id=e['id'])
+    # после ответа снова список
     kb = types.InlineKeyboardMarkup().add(
-        types.InlineKeyboardButton("✅ Да", callback_data="del_confirm"),
-        types.InlineKeyboardButton("❌ Нет", callback_data="del_cancel")
+        types.InlineKeyboardButton("🔄 Список вопросов", callback_data="faq_list")
     )
-    await msg.answer(f"Удалить #{e['id']} «{e['question']}»?", reply_markup=kb)
-    await AdminDelFAQ.waiting_for_confirm.set()
-
-@dp.callback_query_handler(lambda c: c.data in ['del_confirm','del_cancel'],
-                           state=AdminDelFAQ.waiting_for_confirm)
-async def faq_del_confirm(c: types.CallbackQuery, state: FSMContext):
-    if c.data == 'del_confirm':
-        eid = (await state.get_data())['del_id']
-        delete_entry(eid)
-        await c.message.edit_text(f"✅ FAQ #{eid} удалён.")
-    else:
-        await c.message.edit_text("❌ Удаление отменено.")
+    await message.answer("Чтобы увидеть заново, нажмите кнопку.", reply_markup=kb)
     await state.finish()
-    await c.answer()
 
 if __name__ == '__main__':
-    executor.start_polling(dp)
+    executor.start_polling(dp, skip_updates=True)
