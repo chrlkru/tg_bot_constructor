@@ -1,10 +1,14 @@
-# templates/faq_bot/bot.py.j2
+{% raw %}
+# templates/faq_bot/bot.py
+
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
-import sqlite3
 from pathlib import Path
+
+from utils.db_safe import transaction, safe_execute
+from utils.media import save_media_file
 
 # — Инициализация бота и FSM —
 bot = Bot(token="{{ project.token }}")
@@ -14,13 +18,11 @@ dp = Dispatcher(bot, storage=storage)
 # — Константы —
 PROJECT_ID = {{ project.id }}
 ADMIN_CHAT = {{ project.content.admin_chat_id }}
-DB_PATH    = Path(__file__).parent.parent / "app" / "database.db"
+DB_PATH    = Path(__file__).parent.parent / "database.db"
 
 # — Создание таблицы FAQ, если её нет —
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
+with transaction(DB_PATH) as conn:
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS faq_entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             project_id INTEGER,
@@ -29,46 +31,33 @@ def init_db():
             media_path TEXT
         )
     """)
-    conn.commit()
-    conn.close()
-
-init_db()
 
 # — Работа с БД FAQ —
 def get_entries():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, question, answer, media_path FROM faq_entries WHERE project_id=? ORDER BY id",
-        (PROJECT_ID,)
+    rows = safe_execute(
+        "SELECT id,question,answer,media_path FROM faq_entries WHERE project_id=? ORDER BY id",
+        (PROJECT_ID,),
+        DB_PATH
     )
-    rows = cur.fetchall()
-    conn.close()
     return [
-        {"id": r[0], "question": r[1], "answer": r[2], "media": r[3]} for r in rows
+        {"id": r[0], "question": r[1], "answer": r[2], "media": r[3] or ""}
+        for r in rows
     ]
 
 def add_entry(question, answer, media_path):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO faq_entries (project_id,question,answer,media_path) VALUES (?,?,?,?)",
-        (PROJECT_ID, question, answer, media_path or "")
-    )
-    eid = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return eid
+    with transaction(DB_PATH) as conn:
+        cur = conn.execute(
+            "INSERT INTO faq_entries(project_id,question,answer,media_path) VALUES(?,?,?,?)",
+            (PROJECT_ID, question, answer, media_path or "")
+        )
+        return cur.lastrowid
 
 def delete_entry(entry_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "DELETE FROM faq_entries WHERE project_id=? AND id=?",
-        (PROJECT_ID, entry_id)
-    )
-    conn.commit()
-    conn.close()
+    with transaction(DB_PATH) as conn:
+        conn.execute(
+            "DELETE FROM faq_entries WHERE project_id=? AND id=?",
+            (PROJECT_ID, entry_id)
+        )
 
 # — FSM-состояния —
 class FAQState(StatesGroup):
@@ -82,7 +71,7 @@ class AdminStates(StatesGroup):
     deleting_selection     = State()
     deleting_confirmation  = State()
 
-# — Утилиты —
+# — Утилиты для текста и меню —
 def format_questions(entries):
     text = "📖 FAQ — Список вопросов:\n\n"
     for idx, e in enumerate(entries, start=1):
@@ -122,10 +111,8 @@ async def admin_help(msg: types.Message):
 @dp.message_handler(state="*")
 async def fallback(msg: types.Message):
     if msg.chat.id == ADMIN_CHAT:
-        # админ: показать меню
         await msg.answer("🛠 Главное меню FAQ:", reply_markup=build_admin_menu())
     else:
-        # пользователь: подсказка
         await msg.answer("❓ Нажмите /faq или кнопку «Список вопросов».")
 
 # === Админ-меню через кнопки ===
@@ -161,16 +148,40 @@ async def admin_add_a(msg: types.Message, state: FSMContext):
     await msg.answer("📷 Прикрепите медиа-файл или введите «нет»:")
     await AdminStates.adding_media.set()
 
-@dp.message_handler(state=AdminStates.adding_media, lambda m: m.chat.id==ADMIN_CHAT, content_types=types.ContentTypes.ANY)
+@dp.message_handler(
+    state=AdminStates.adding_media,
+    lambda m: m.chat.id==ADMIN_CHAT,
+    content_types=types.ContentTypes.ANY
+)
 async def admin_add_m(msg: types.Message, state: FSMContext):
     data = await state.get_data()
     media = ""
-    if msg.content_type in ['photo','document']:
-        saved = await msg.document.download(destination_dir=f"media/{PROJECT_ID}")
-        media = saved.name
+    if msg.content_type == 'photo':
+        file_id = msg.photo[-1].file_id
+        file_obj = await bot.get_file(file_id)
+        data_bytes = await bot.download_file(file_obj.file_path)
+        path = save_media_file(
+            project_id=PROJECT_ID,
+            file_bytes=data_bytes,
+            original_filename=f"{file_id}.jpg",
+            media_root=Path(__file__).parent.parent / "media"
+        )
+        media = path.name
+    elif msg.content_type == 'document':
+        file_id = msg.document.file_id
+        file_obj = await bot.get_file(file_id)
+        data_bytes = await bot.download_file(file_obj.file_path)
+        path = save_media_file(
+            project_id=PROJECT_ID,
+            file_bytes=data_bytes,
+            original_filename=msg.document.file_name,
+            media_root=Path(__file__).parent.parent / "media"
+        )
+        media = path.name
     elif msg.text.strip().lower() != 'нет':
         await msg.answer("❗ Ожидался файл или «нет». Отмена.")
         return await state.finish()
+
     eid = add_entry(data['question'], data['answer'], media)
     await msg.answer(f"✅ FAQ #{eid} добавлен.", reply_markup=build_admin_menu())
     await state.finish()
@@ -205,7 +216,10 @@ async def admin_del_select(msg: types.Message, state: FSMContext):
     await msg.answer(f"Удалить FAQ #{e['id']} «{e['question']}»?", reply_markup=kb)
     await AdminStates.deleting_confirmation.set()
 
-@dp.callback_query_handler(lambda c: c.data in ['del_confirm','del_cancel'], state=AdminStates.deleting_confirmation)
+@dp.callback_query_handler(
+    lambda c: c.data in ['del_confirm','del_cancel'],
+    state=AdminStates.deleting_confirmation
+)
 async def admin_del_confirm(c: types.CallbackQuery, state: FSMContext):
     if c.data=='del_confirm':
         eid = (await state.get_data())['del_id']
@@ -263,7 +277,6 @@ async def process_choice(message: types.Message, state: FSMContext):
             await message.answer(e['answer'])
     else:
         await message.answer(e['answer'])
-    # после ответа снова список
     kb = types.InlineKeyboardMarkup().add(
         types.InlineKeyboardButton("🔄 Список вопросов", callback_data="faq_list")
     )
@@ -272,3 +285,4 @@ async def process_choice(message: types.Message, state: FSMContext):
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
+{% endraw %}

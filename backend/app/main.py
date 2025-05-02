@@ -1,3 +1,5 @@
+# main.py
+
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -11,6 +13,7 @@ import json
 
 from app.database import init_db, create_project, get_projects
 from app.schemas import BotProject
+from app.utils.media import save_media_file, list_media_files
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -54,22 +57,39 @@ async def upload_media(
     files: List[UploadFile] = File(...)
 ):
     """
-    Загружает медиа-файлы для проекта.
-    Кладёт их в папку media/{project_id}/
+    Загружает медиа-файлы для проекта через общую утилиту save_media_file.
+    Кладёт их в media/{project_id}/, возвращает список имён сохранённых файлов.
     """
     project = get_projects(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Проект не найден")
 
-    media_dir = BASE_DIR / "media" / str(project_id)
-    media_dir.mkdir(parents=True, exist_ok=True)
-
+    saved = []
     for upload in files:
-        dest = media_dir / upload.filename
-        with open(dest, "wb") as f:
-            f.write(await upload.read())
+        data = await upload.read()
+        try:
+            path = save_media_file(
+                project_id=project_id,
+                file_bytes=data,
+                original_filename=upload.filename,
+                media_root=BASE_DIR / "media"
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        saved.append(path.name)
 
-    return {"status": "media_uploaded", "count": len(files)}
+    return {"status": "media_uploaded", "files": saved}
+
+@app.get("/projects/{project_id}/media")
+def list_media(project_id: int):
+    """
+    Возвращает список загруженных для проекта media-файлов.
+    """
+    project = get_projects(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Проект не найден")
+    files = list_media_files(project_id, media_root=BASE_DIR / "media")
+    return {"files": [f.name for f in files]}
 
 @app.get("/projects/{project_id}/export")
 def export_bot(project_id: int):
@@ -92,12 +112,12 @@ def export_bot(project_id: int):
         shutil.rmtree(export_dir)
     export_dir.mkdir(parents=True)
 
-    # 1) Сгенерировать все .j2 → .py (и другие) из шаблона
+    # 1) Рендер .j2 → .py
     env = Environment(loader=FileSystemLoader(str(template_path)))
     for tpl in template_path.glob("*.j2"):
         tpl_obj = env.get_template(tpl.name)
         rendered = tpl_obj.render(project=project)
-        out_name = tpl.name[:-3]  # убираем '.j2'
+        out_name = tpl.name[:-3]
         (export_dir / out_name).write_text(rendered, encoding="utf-8")
 
     # 2) .env
@@ -161,7 +181,7 @@ def export_bot(project_id: int):
         encoding="utf-8"
     )
 
-    # 6) Копируем медиа, если они есть
+    # 6) Копируем медиа через shutil (util используется при загрузке)
     media_src = BASE_DIR / "media" / str(project_id)
     if media_src.exists():
         shutil.copytree(media_src, export_dir / "media")
