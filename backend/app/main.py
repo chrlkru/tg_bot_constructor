@@ -1,6 +1,5 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from app.database import init_db, create_project, get_projects
-from app.schemas import BotProject
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from jinja2 import Environment, FileSystemLoader
 from pathlib import Path
@@ -10,18 +9,23 @@ import shutil
 import os
 import json
 
-from fastapi.middleware.cors import CORSMiddleware
+from app.database import init_db, create_project, get_projects
+from app.schemas import BotProject
+
+BASE_DIR = Path(__file__).resolve().parent
 
 app = FastAPI()
 
+# CORS для фронтенда
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # адрес фронтенда
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
+# Инициализируем БД
 init_db()
 
 @app.get("/")
@@ -32,9 +36,12 @@ def root():
 async def create_new_project(
     project: str = Form(...)
 ):
+    """
+    Ожидает JSON-представление проекта в поле Form 'project'.
+    """
     try:
-        project_dict = json.loads(project)
-        bot_project = BotProject(**project_dict)
+        data = json.loads(project)
+        bot_project = BotProject(**data)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Ошибка парсинга проекта: {e}")
 
@@ -46,11 +53,15 @@ async def upload_media(
     project_id: int,
     files: List[UploadFile] = File(...)
 ):
+    """
+    Загружает медиа-файлы для проекта.
+    Кладёт их в папку media/{project_id}/
+    """
     project = get_projects(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Проект не найден")
 
-    media_dir = Path(__file__).parent.parent / "media" / str(project_id)
+    media_dir = BASE_DIR / "media" / str(project_id)
     media_dir.mkdir(parents=True, exist_ok=True)
 
     for upload in files:
@@ -62,82 +73,110 @@ async def upload_media(
 
 @app.get("/projects/{project_id}/export")
 def export_bot(project_id: int):
+    """
+    Генерирует исходники бота из шаблона + медиа + служебные файлы,
+    упаковывает в ZIP и возвращает FileResponse.
+    """
     project = get_projects(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Проект не найден")
 
     template_type = project["template_type"]
-    template_path = Path(__file__).parent / "templates" / template_type
-    template_file = template_path / f"{template_type}.py.j2"
+    template_path = BASE_DIR / "templates" / template_type
 
-    if not template_file.exists():
-        raise HTTPException(status_code=404, detail="Файл шаблона не найден")
+    if not template_path.exists():
+        raise HTTPException(status_code=404, detail="Шаблон не найден")
 
-    export_dir = Path(__file__).parent / "exports" / f"project_{project_id}"
-    export_dir.mkdir(parents=True, exist_ok=True)
+    export_dir = BASE_DIR / "exports" / f"project_{project_id}"
+    if export_dir.exists():
+        shutil.rmtree(export_dir)
+    export_dir.mkdir(parents=True)
 
-    env = Environment(loader=FileSystemLoader(template_path))
-    template = env.get_template(f"{template_type}.py.j2")
-    rendered = template.render(project=project)
+    # 1) Сгенерировать все .j2 → .py (и другие) из шаблона
+    env = Environment(loader=FileSystemLoader(str(template_path)))
+    for tpl in template_path.glob("*.j2"):
+        tpl_obj = env.get_template(tpl.name)
+        rendered = tpl_obj.render(project=project)
+        out_name = tpl.name[:-3]  # убираем '.j2'
+        (export_dir / out_name).write_text(rendered, encoding="utf-8")
 
-    output_file = export_dir / "bot.py"
-    with open(output_file, "w", encoding="utf-8") as f:
-        f.write(rendered)
+    # 2) .env
+    (export_dir / ".env").write_text(f"TOKEN={project['token']}\n", encoding="utf-8")
 
-    # Добавляем стандартные файлы
-    with open(export_dir / ".env", "w", encoding="utf-8") as f:
-        f.write(f'TOKEN={project["token"]}\n')
+    # 3) requirements.txt
+    deps = [
+        "aiogram",
+        "python-dotenv",
+        "Pillow",
+        "openpyxl"
+    ]
+    (export_dir / "requirements.txt").write_text("\n".join(deps), encoding="utf-8")
 
-    with open(export_dir / "requirements.txt", "w", encoding="utf-8") as f:
-        f.write("aiogram\npython-dotenv\nPillow\nopenpyxl\n")
+    # 4) README.md
+    readme = export_dir / "README.md"
+    readme.write_text(
+        f"# {project['name']}\n\n"
+        f"{project['description']}\n\n"
+        "## Как запустить бота:\n"
+        "```bash\n"
+        "pip install -r requirements.txt\n"
+        "python bot.py\n"
+        "```\n",
+        encoding="utf-8"
+    )
 
-    with open(export_dir / "README.md", "w", encoding="utf-8") as f:
-        f.write(f"# {project['name']}\n\n")
-        f.write(f"{project['description']}\n\n")
-        f.write("## Как запустить бота:\n")
-        f.write("```bash\n")
-        f.write("pip install -r requirements.txt\n")
-        f.write("python bot.py\n")
-        f.write("```\n")
+    # 5) run.py
+    run_py = export_dir / "run.py"
+    run_py.write_text(
+        "\n".join([
+            "import os",
+            "import subprocess",
+            "import sys",
+            "",
+            "def install_requirements():",
+            "    try:",
+            "        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt'])",
+            "    except subprocess.CalledProcessError as e:",
+            "        print('Ошибка при установке зависимостей:', e)",
+            "        sys.exit(1)",
+            "",
+            "def run_bot():",
+            "    from aiogram import Bot, Dispatcher, executor, types",
+            "    from dotenv import load_dotenv",
+            "",
+            "    load_dotenv()",
+            "    bot = Bot(token=os.getenv('TOKEN'))",
+            "    dp = Dispatcher(bot)",
+            "",
+            "    @dp.message_handler(commands=['start'])",
+            "    async def start(message: types.Message):",
+            "        await message.answer('Бот запущен и готов к работе!')",
+            "",
+            "    executor.start_polling(dp)",
+            "",
+            "if __name__ == '__main__':",
+            "    install_requirements()",
+            "    run_bot()",
+        ]),
+        encoding="utf-8"
+    )
 
-    with open(export_dir / "run.py", "w", encoding="utf-8") as f:
-        f.write("import os\n")
-        f.write("import subprocess\n")
-        f.write("import sys\n\n")
-        f.write("# Установка зависимостей\n")
-        f.write("def install_requirements():\n")
-        f.write("    try:\n")
-        f.write("        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt'])\n")
-        f.write("    except subprocess.CalledProcessError as e:\n")
-        f.write("        print('Ошибка при установке зависимостей:', e)\n")
-        f.write("        sys.exit(1)\n\n")
-        f.write("# Запуск бота\n")
-        f.write("def run_bot():\n")
-        f.write("    from aiogram import Bot, Dispatcher, executor, types\n")
-        f.write("    from dotenv import load_dotenv\n\n")
-        f.write("    load_dotenv()\n")
-        f.write("    bot = Bot(token=os.getenv('TOKEN'))\n")
-        f.write("    dp = Dispatcher(bot)\n\n")
-        f.write("    @dp.message_handler(commands=['start'])\n")
-        f.write("    async def start(message: types.Message):\n")
-        f.write("        await message.answer('Бот запущен и готов к работе!')\n\n")
-        f.write("    executor.start_polling(dp)\n\n")
-        f.write("if __name__ == '__main__':\n")
-        f.write("    install_requirements()\n")
-        f.write("    run_bot()\n")
-
-    # Копируем медиа
-    media_src = Path(__file__).parent.parent / "media" / str(project_id)
-    media_dst = export_dir / "media"
+    # 6) Копируем медиа, если они есть
+    media_src = BASE_DIR / "media" / str(project_id)
     if media_src.exists():
-        shutil.copytree(media_src, media_dst)
+        shutil.copytree(media_src, export_dir / "media")
 
-    # Архивируем
-    zip_path = Path(__file__).parent / "exports" / f"project_{project_id}.zip"
+    # 7) Упаковка в ZIP
+    zip_path = BASE_DIR / "exports" / f"project_{project_id}.zip"
     with ZipFile(zip_path, "w") as zipf:
         for file in export_dir.rglob("*"):
             zipf.write(file, arcname=file.relative_to(export_dir))
 
+    # 8) Удаляем временную папку
     shutil.rmtree(export_dir)
 
-    return FileResponse(zip_path, filename=f"{project['name']}.zip", media_type="application/zip")
+    return FileResponse(
+        path=str(zip_path),
+        filename=f"{project['name']}.zip",
+        media_type="application/zip"
+    )
