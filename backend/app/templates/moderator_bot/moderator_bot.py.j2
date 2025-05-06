@@ -1,22 +1,32 @@
-{# templates/moderator_bot/bot.py.j2 #}
 #!/usr/bin/env python3
+import os
+from dotenv import load_dotenv
+
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 
-from app.utils.moderation import (
-    check_message, add_strike, log_violation,
-    format_report, toggle_setting,
-    whitelist_add, whitelist_del, list_whitelist,
+from utils.moderation import (
+    check_message,
+    add_strike,
+    log_violation,
+    format_report,
+    toggle_setting,
+    whitelist_add,
+    whitelist_del,
+    list_whitelist,
     get_settings
 )
 
-BOT_TOKEN  = "{{ project.token }}"
-PROJECT_ID = {{ project.id }}
-ADMIN_CHAT = {{ project.content.admin_chat_id }}
-
+# — Инициализация токена и бота —
+load_dotenv()
+BOT_TOKEN = os.getenv("TOKEN")
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp  = Dispatcher(bot, storage=MemoryStorage())
+
+# — Константы —
+PROJECT_ID = {{ project.id }}
+ADMIN_CHAT = {{ project.content.admin_chat_id }}
 
 # ── Автоматический фильтр ───────────────────────────────
 @dp.message_handler(content_types=types.ContentTypes.ANY)

@@ -1,13 +1,47 @@
-# Backend
-/backend/__pycache__/
-/backend/**/*.db
+# ==== Python ====
+# Byte-compiled / optimized / DLL files
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Logs and coverage
+*.log
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# ==== Backend project ====
 /backend/.env
+/backend/**/*.db
 /backend/app/exports/
+
 /backend/.idea/
-# Frontend
+
+# ==== Frontend project ====
 /frontend/node_modules/
 /frontend/build/
+/frontend/.env.local
+# (Add other build dirs if used, e.g. .next/, .nuxt/)
 
-/.venv/
-/.idea/
+/frontend/.idea/
+
+# ==== IDEs and editors ====
+.idea/
 .vscode/
+*~
+.*.sw?
+
+# ==== Misc ====
+*.zip
+.DS_Store

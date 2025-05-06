@@ -1,24 +1,34 @@
-{% raw %}
-# templates/order_bot/bot.py
+
+#!/usr/bin/env python3
+import os
+from pathlib import Path
+from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
-from pathlib import Path
 
-from utils.collage import generate_collage
-from utils.media import save_media_file
-from app.database import (
-    get_products_list, add_to_cart, get_cart_items, update_cart_item,
-    delete_cart_item, clear_cart, save_order,
-    add_product, delete_product, ban_user, is_banned
+from utils.dp import (
+    get_products_list,
+    add_to_cart,
+    get_cart_items,
+    update_cart_item,
+    delete_cart_item,
+    clear_cart,
+    save_order,
+    add_product,
+    delete_product,
+    is_banned,
 )
+from utils.collage import generate_collage
+from utils.media   import save_media_file
 
 # --- Конфиг ---
-bot = Bot(token="{{ project.token }}")
-storage = MemoryStorage()
-dp = Dispatcher(bot, storage=storage)
+load_dotenv()
+BOT_TOKEN = os.getenv("TOKEN")
+bot       = Bot(token=BOT_TOKEN, parse_mode="HTML")
+dp        = Dispatcher(bot, storage=MemoryStorage())
 
 PROJECT_ID = {{ project.id }}
 ADMIN_CHAT = {{ project.content.admin_chat_id }}
@@ -51,6 +61,7 @@ async def cmd_catalog(msg: types.Message, state: FSMContext):
         return await msg.answer("❌ Вы заблокированы.")
     await state.update_data(page=1)
     await send_catalog_page(msg.chat.id, state)
+
 
 async def send_catalog_page(chat_id, state: FSMContext):
     data = await state.get_data()

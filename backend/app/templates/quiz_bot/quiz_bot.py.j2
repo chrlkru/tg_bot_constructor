@@ -12,10 +12,11 @@ from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 
 from utils.excel import append_survey_result, send_excel_report
+from openpyxl import load_workbook
 
 # — Загрузка окружения —
 load_dotenv()
-BOT_TOKEN   = os.getenv("BOT_TOKEN")
+BOT_TOKEN   = os.getenv("TOKEN")
 ADMIN_CHAT  = {{ project.content.admin_chat_id }}
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)

@@ -1,22 +1,30 @@
-{# templates/feedback_bot/feedback_bot.py.j2 #}
 #!/usr/bin/env python3
+import os
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
+from pathlib import Path
+from dotenv import load_dotenv
 
-from app.utils.feedback import log_feedback, block_user, is_blocked
+from utils.dp import log_feedback, block_user, is_blocked
+from utils.media import save_media_file
 
-BOT_TOKEN  = "{{ project.token }}"
+# — Инициализация бота и FSM —
+load_dotenv()
+BOT_TOKEN = os.getenv("TOKEN")
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+dp  = Dispatcher(bot, storage=MemoryStorage())
+
+# — Константы —
 PROJECT_ID = {{ project.id }}
 ADMIN_CHAT = {{ project.content.admin_chat_id }}
 
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
-dp  = Dispatcher(bot, storage=MemoryStorage())
 
 # ── FSM для ответа админа ────────────────────────
 class ReplyState(StatesGroup):
     waiting_text = State()
+
 
 # ── Пользователь присылает любое сообщение ───────
 @dp.message_handler(chat_type=types.ChatType.PRIVATE, content_types=types.ContentTypes.ANY)
@@ -47,6 +55,7 @@ async def handle_incoming(msg: types.Message):
 
     await msg.answer("✅ Ваше сообщение получено! Администратор свяжется с вами.")
 
+
 # ── Начало ответа админа ─────────────────────────
 @dp.callback_query_handler(lambda c: c.data.startswith("reply_") and c.message.chat.id==ADMIN_CHAT)
 async def admin_reply_start(c: types.CallbackQuery, state: FSMContext):
@@ -56,11 +65,13 @@ async def admin_reply_start(c: types.CallbackQuery, state: FSMContext):
     await ReplyState.waiting_text.set()
     await c.answer()
 
+
 # ── Отмена ответа ────────────────────────────────
 @dp.message_handler(commands=['cancel'], state=ReplyState.waiting_text)
 async def admin_reply_cancel(msg: types.Message, state: FSMContext):
     await state.finish()
     await msg.answer("❎ Отменено.")
+
 
 # ── Отправка ответа пользователю ─────────────────
 @dp.message_handler(state=ReplyState.waiting_text, chat_type=types.ChatType.PRIVATE)
@@ -71,6 +82,7 @@ async def admin_reply_send(msg: types.Message, state: FSMContext):
     log_feedback(PROJECT_ID, uid, 'out', msg.text)
     await msg.answer("✅ Ответ отправлен.")
     await state.finish()
+
 
 # ── Бан пользователя ────────────────────────────
 @dp.callback_query_handler(lambda c: c.data.startswith("ban_") and c.message.chat.id==ADMIN_CHAT)
@@ -84,6 +96,7 @@ async def admin_ban(c: types.CallbackQuery):
         pass
     await c.answer("Пользователь заблокирован")
 
+
 # ── Команды помощи ───────────────────────────────
 @dp.message_handler(commands=['start','help'], chat_type=types.ChatType.PRIVATE)
 async def cmd_start(msg: types.Message):
@@ -91,6 +104,7 @@ async def cmd_start(msg: types.Message):
         "🤖 Напишите любое сообщение — оно анонимно уйдёт администратору.\n"
         "Админ сможет ответить через бота."
     )
+
 
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True)

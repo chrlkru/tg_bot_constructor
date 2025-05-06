@@ -1,63 +1,28 @@
-{% raw %}
-# templates/faq_bot/bot.py
-
+import os
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from pathlib import Path
+from dotenv import load_dotenv
 
-from utils.db_safe import transaction, safe_execute
+from utils.dp import (
+    transaction,
+    safe_execute,
+    get_faq_entries,
+    add_faq_entry,
+    delete_faq_entry
+)
 from utils.media import save_media_file
 
-# — Инициализация бота и FSM —
-bot = Bot(token="{{ project.token }}")
+load_dotenv()
+BOT_TOKEN = os.getenv("TOKEN")
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
-# — Константы —
 PROJECT_ID = {{ project.id }}
 ADMIN_CHAT = {{ project.content.admin_chat_id }}
-DB_PATH    = Path(__file__).parent.parent / "database.db"
-
-# — Создание таблицы FAQ, если её нет —
-with transaction(DB_PATH) as conn:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS faq_entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id INTEGER,
-            question TEXT,
-            answer TEXT,
-            media_path TEXT
-        )
-    """)
-
-# — Работа с БД FAQ —
-def get_entries():
-    rows = safe_execute(
-        "SELECT id,question,answer,media_path FROM faq_entries WHERE project_id=? ORDER BY id",
-        (PROJECT_ID,),
-        DB_PATH
-    )
-    return [
-        {"id": r[0], "question": r[1], "answer": r[2], "media": r[3] or ""}
-        for r in rows
-    ]
-
-def add_entry(question, answer, media_path):
-    with transaction(DB_PATH) as conn:
-        cur = conn.execute(
-            "INSERT INTO faq_entries(project_id,question,answer,media_path) VALUES(?,?,?,?)",
-            (PROJECT_ID, question, answer, media_path or "")
-        )
-        return cur.lastrowid
-
-def delete_entry(entry_id):
-    with transaction(DB_PATH) as conn:
-        conn.execute(
-            "DELETE FROM faq_entries WHERE project_id=? AND id=?",
-            (PROJECT_ID, entry_id)
-        )
 
 # — FSM-состояния —
 class FAQState(StatesGroup):

@@ -1,5 +1,3 @@
-# main.py
-
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -128,7 +126,8 @@ def export_bot(project_id: int):
         "aiogram",
         "python-dotenv",
         "Pillow",
-        "openpyxl"
+        "openpyxl",
+        "apscheduler"
     ]
     (export_dir / "requirements.txt").write_text("\n".join(deps), encoding="utf-8")
 
@@ -186,13 +185,53 @@ def export_bot(project_id: int):
     if media_src.exists():
         shutil.copytree(media_src, export_dir / "media")
 
-    # 7) Упаковка в ZIP
+    # 7) Добавляем Windows-скрипты для удобства запуск/остановки
+    start_bat = export_dir / "start_bot.bat"
+    start_bat.write_text(r'''@echo off
+pip install -r requirements.txt
+start "" /B python bot.py > bot.log 2>&1
+for /f "tokens=2" %%a in ('tasklist /FI "IMAGENAME eq python.exe" /FO LIST /V ^| findstr /R /C:"Window Title: bot.py"') do set BOT_PID=%%a
+echo %BOT_PID% > bot.pid
+echo Bot started. PID=%BOT_PID%, logs→bot.log
+pause
+''', encoding="utf-8")
+
+    stop_bat = export_dir / "stop_bot.bat"
+    stop_bat.write_text(r'''@echo off
+if not exist bot.pid (
+  echo bot.pid not found. Bot may not be running.
+  pause
+  exit /b
+)
+set /p BOT_PID=<bot.pid
+taskkill /PID %BOT_PID% /F >nul 2>&1
+if errorlevel 1 (
+  echo Could not find process %BOT_PID%. It may have already exited.
+) else (
+  echo Process %BOT_PID% stopped.
+)
+del bot.pid
+pause
+''', encoding="utf-8")
+
+    # 6-bis) Копируем все утилиты (включая dp.py) из app/utils → export_dir/utils
+    shutil.copytree(
+        BASE_DIR / "app" / "utils",
+        export_dir / "utils",
+    )
+    # Делаем utils/ пакетом Python
+    (export_dir / "utils" / "__init__.py").touch(exist_ok=True)
+
+    # 6-ter) Создаём пустой файл базы sqlite рядом с dp.py
+    (export_dir / "utils" / "database.db").touch(exist_ok=True)
+
+    # 8) Упаковка в ZIP
     zip_path = BASE_DIR / "exports" / f"project_{project_id}.zip"
     with ZipFile(zip_path, "w") as zipf:
         for file in export_dir.rglob("*"):
             zipf.write(file, arcname=file.relative_to(export_dir))
 
-    # 8) Удаляем временную папку
+    # 9) Удаляем временную папку
     shutil.rmtree(export_dir)
 
     return FileResponse(

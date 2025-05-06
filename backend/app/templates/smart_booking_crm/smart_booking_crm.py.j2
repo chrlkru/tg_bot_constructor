@@ -14,23 +14,27 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from openpyxl import Workbook, load_workbook
 
-from app.database import (
+from utils.dp import (
     init_db,
-    # services
-    add_service, get_services, delete_service,
-    # work intervals
-    add_work_interval, get_work_intervals, delete_work_interval,
-    # panic exceptions
-    add_work_exception, activate_planned_exception, cancel_bookings_in_interval,
-    # bookings & users
-    create_booking_safe, get_booking, ban_user, is_banned,
-    # reminders & summary
-    get_confirmed_future_bookings, get_planned_exceptions, get_bookings_by_date,
-    # export CRM
-    get_all_clients, get_all_bookings,
-    # settings
-    get_setting, set_setting
+    add_service,
+    get_services,
+    delete_service,
+    add_work_interval,
+    delete_work_interval,
+    add_work_exception,
+    cancel_bookings_in_interval,
+    get_planned_exceptions,
+    get_confirmed_future_bookings,
+    create_booking_safe,
+    get_booking,
+    get_bookings_by_date,
+    get_all_clients,
+    get_all_bookings,
+    get_setting,
+    set_setting,
 )
+
+
 from utils.inline_calendar import build_date_calendar, build_schedule_view
 from utils.slots import (
     is_slot_blocked, is_slot_booked, find_free_slots,
