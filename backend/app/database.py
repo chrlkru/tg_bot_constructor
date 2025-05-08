@@ -3,6 +3,8 @@
 import sqlite3
 import json
 import os
+import json
+from app.utils.db_safe import transaction
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -196,7 +198,12 @@ def create_project(project):
             )
         )
         return cur.lastrowid
-
+def update_project_content(project_id: int, content: dict):
+    with transaction(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE projects SET content=? WHERE id=?",
+            (json.dumps(content), project_id)
+        )
 def get_projects(project_id=None):
     if project_id is not None:
         rows = safe_execute(

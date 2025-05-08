@@ -5,12 +5,16 @@ from jinja2 import Environment, FileSystemLoader
 from pathlib import Path
 from zipfile import ZipFile
 from typing import List
+from app.database import init_db, create_project, get_projects, DB_PATH
+from app.export_utils import build_single_project_db
+
 import shutil
 import os
 import json
 
-from app.database import init_db, create_project, get_projects
-from app.schemas import BotProject
+
+from app.schemas import ProjectCreate
+
 from app.utils.media import save_media_file, list_media_files
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -42,7 +46,7 @@ async def create_new_project(
     """
     try:
         data = json.loads(project)
-        bot_project = BotProject(**data)
+        bot_project = ProjectCreate(**data)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Ошибка парсинга проекта: {e}")
 
@@ -219,11 +223,16 @@ pause
         BASE_DIR / "app" / "utils",
         export_dir / "utils",
     )
-    # Делаем utils/ пакетом Python
     (export_dir / "utils" / "__init__.py").touch(exist_ok=True)
 
-    # 6-ter) Создаём пустой файл базы sqlite рядом с dp.py
-    (export_dir / "utils" / "database.db").touch(exist_ok=True)
+    # 6-ter) Генерируем базу для бота с записями только этого проекта
+    tmp_db = build_single_project_db(
+        src_db=DB_PATH,
+        schema_db=BASE_DIR / "app" / "schema.db",
+        project_id=project_id
+    )
+    shutil.copy(tmp_db, export_dir / "utils" / "database.db")
+    tmp_db.unlink()
 
     # 8) Упаковка в ZIP
     zip_path = BASE_DIR / "exports" / f"project_{project_id}.zip"
@@ -231,9 +240,7 @@ pause
         for file in export_dir.rglob("*"):
             zipf.write(file, arcname=file.relative_to(export_dir))
 
-    # 9) Удаляем временную папку
     shutil.rmtree(export_dir)
-
     return FileResponse(
         path=str(zip_path),
         filename=f"{project['name']}.zip",

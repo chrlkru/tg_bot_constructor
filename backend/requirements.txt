@@ -5,3 +5,4 @@ python-dotenv
 pydantic
 aiofiles
 httpx
+python-multipart
