@@ -13,9 +13,18 @@ from app.utils.db_safe import transaction, safe_execute
 DB_PATH = Path(__file__).resolve().parent / "database.db"
 SLOT_SIZE_MIN = 15  # минута ячейки для расписания
 
-def init_db():
-    with transaction(DB_PATH) as conn:
+def init_db(db_path: Path = None):
+    """
+    Инициализирует схему в файле SQLite.
+    Если db_path не указан, используется основной DB_PATH.
+    """
+    if db_path is None:
+        db_path = DB_PATH
+    with transaction(db_path) as conn:
         cur = conn.cursor()
+        # … остальной код без изменений …
+
+
         # Проекты
         cur.execute("""
         CREATE TABLE IF NOT EXISTS projects (

@@ -1,424 +1,526 @@
-
+{# --------------------------------------------------------------------
+   Order-Bot (aiogram-3) — файл-шаблон
+   После генерации подставляются переменные:
+       {{ project_id }}    – числовой ID проекта (коллекция в БД)
+       {{ admin_chat_id }} – id группы, где доступна админ-панель
+-------------------------------------------------------------------- #}
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import logging
 import os
+import tempfile
 from pathlib import Path
+from html import escape
+
 from dotenv import load_dotenv
-
-from aiogram import Bot, Dispatcher, executor, types
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
-
-from utils.dp import (
-    get_products_list,
-    add_to_cart,
-    get_cart_items,
-    update_cart_item,
-    delete_cart_item,
-    clear_cart,
-    save_order,
-    add_product,
-    delete_product,
-    is_banned,
+from aiogram import Bot, Dispatcher, types
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import (
+    BotCommand, BotCommandScopeDefault, BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats, BotCommandScopeChat, FSInputFile
 )
-from utils.collage import generate_collage
-from utils.media   import save_media_file
 
-# --- Конфиг ---
+# ─────────────────────────── конфигурация ────────────────────────────
 load_dotenv()
 BOT_TOKEN = os.getenv("TOKEN")
-bot       = Bot(token=BOT_TOKEN, parse_mode="HTML")
-dp        = Dispatcher(bot, storage=MemoryStorage())
+if not BOT_TOKEN:
+    raise RuntimeError("Переменная TOKEN не задана")
 
-PROJECT_ID = {{ project.id }}
-ADMIN_CHAT = {{ project.content.admin_chat_id }}
+PROJECT_ID = {{ project_id }}
+ADMIN_CHAT = {{ admin_chat_id }}
 
-# --- FSM-состояния ---
+
+# ──────────────────────── подключаем БД-модуль ───────────────────────
+# utils/order_dp.py должен лежать рядом с utils/order_bot.db
+from utils import order_dp as db          # ← новый import
+
+db.init_db()
+
+# при первой установке добавляем демонстрационный товар
+if not db.get_products_list(PROJECT_ID):
+    db.add_product(
+        PROJECT_ID,
+        "Тестовый товар",
+        "Краткое описание, 100 ₽",
+        "Полное описание тестового товара.",
+        "sample.jpg"                      # положите картинку media/<project_id>/sample.jpg
+    )
+
+# ────────────────────────── инициализация ─────────────────────────────
+bot = Bot(token=BOT_TOKEN,
+          default=DefaultBotProperties(parse_mode="HTML"))
+dp  = Dispatcher(storage=MemoryStorage())
+
+MEDIA_ROOT = Path(__file__).resolve().parent / "media" / str(PROJECT_ID)
+
+# ──────────────────────── состояния FSM ───────────────────────────────
 class CatalogState(StatesGroup):
     page = State()
 
 class CartState(StatesGroup):
-    viewing = State()
     checkout_address = State()
-    checkout_media = State()
     checkout_confirm = State()
 
 class ProductAdminState(StatesGroup):
-    name = State()
-    short_desc = State()
-    full_desc = State()
+    name        = State()
+    short_desc  = State()
+    full_desc   = State()
     waiting_img = State()
 
 class DeleteProductState(StatesGroup):
-    selecting_page = State()
+    selecting_page    = State()
     confirming_delete = State()
 
-# --- КАТАЛОГ ---
+# ───────────────────────── вспомогательные ────────────────────────────
+from utils.collage import generate_collage
+from utils.media   import save_media_file
 
-@dp.message_handler(commands=['catalog','start'])
-async def cmd_catalog(msg: types.Message, state: FSMContext):
-    if is_banned(PROJECT_ID, msg.from_user.id):
-        return await msg.answer("❌ Вы заблокированы.")
+# ───────────────────────────── handlers ───────────────────────────────
+@dp.message(Command("chatid"))
+async def cmd_chatid(m: types.Message):
+    await m.answer(f"Этот чат имеет ID: `{m.chat.id}`", parse_mode="Markdown")
+
+# ---------- каталог ----------
+@dp.message(Command("start", "catalog"))
+async def cmd_catalog(m: types.Message, state: FSMContext):
+    if db.is_banned(PROJECT_ID, m.from_user.id):
+        return await m.answer("❌ Вы заблокированы.")
     await state.update_data(page=1)
-    await send_catalog_page(msg.chat.id, state)
+    await send_catalog_page(m.chat.id, state)
 
-
-async def send_catalog_page(chat_id, state: FSMContext):
-    data = await state.get_data()
-    page = data.get('page', 1)
-    prods = get_products_list(PROJECT_ID)
-    slice = prods[(page-1)*9 : page*9]
-
-    img_paths = []
-    for p in slice:
-        media = p["media"]
-        if media:
-            path = Path(__file__).parent.parent / "media" / str(PROJECT_ID) / media
-            img_paths.append(str(path))
-
-    # генерируем коллаж утилитой
-    collage = generate_collage(img_paths, f"/tmp/collage_{page}.jpg")
-
-    kb = types.InlineKeyboardMarkup(row_width=3)
-    for i, p in enumerate(slice, start=1):
-        kb.insert(types.InlineKeyboardButton(str(i), callback_data=f"select_{i}"))
-    if page > 1:
-        kb.insert(types.InlineKeyboardButton("←", callback_data="prev"))
-    if page * 9 < len(prods):
-        kb.insert(types.InlineKeyboardButton("→", callback_data="next"))
-
-    await bot.send_photo(chat_id, collage, caption=f"Страница {page}", reply_markup=kb)
-    await CatalogState.page.set()
-
-@dp.callback_query_handler(lambda c: c.data in ['prev','next'], state=CatalogState.page)
-async def on_nav(c: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    page = data.get('page', 1)
-    prods = get_products_list(PROJECT_ID)
-    if c.data == 'prev' and page > 1:
+@dp.callback_query(lambda c: c.data in {"prev", "next"}, StateFilter(CatalogState.page))
+async def catalog_nav(cq: types.CallbackQuery, state: FSMContext):
+    data  = await state.get_data()
+    page  = data.get("page", 1)
+    items = db.get_products_list(PROJECT_ID)
+    if cq.data == "prev" and page > 1:
         page -= 1
-    if c.data == 'next' and page * 9 < len(prods):
+    if cq.data == "next" and page*9 < len(items):
         page += 1
     await state.update_data(page=page)
-    await send_catalog_page(c.from_user.id, state)
-    await c.answer()
+    await send_catalog_page(cq.message.chat.id, state)
+    await cq.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("select_"), state=CatalogState.page)
-async def on_select(c: types.CallbackQuery, state: FSMContext):
-    idx = int(c.data.split("_")[1]) - 1
-    data = await state.get_data()
-    page = data['page']
-    prods = get_products_list(PROJECT_ID)
-    global_idx = (page-1)*9 + idx
-    if global_idx >= len(prods):
-        return await c.answer("Неправильный выбор", show_alert=True)
-    p = prods[global_idx]
-    media = p["media"]
-    if media:
-        path = Path(__file__).parent.parent / "media" / str(PROJECT_ID) / media
-        await bot.send_photo(
-            c.from_user.id,
-            path.open('rb'),
-            caption=f"{p['name']}\n\n{p['full_desc']}"
-        )
+async def send_catalog_page(chat_id: int, state: FSMContext):
+    page   = (await state.get_data()).get("page", 1)
+    items  = db.get_products_list(PROJECT_ID)
+    slice_ = items[(page-1)*9 : page*9]
+
+    collage_tmp = Path(tempfile.gettempdir()) / f"catalog_{page}.jpg"
+    generate_collage([str(MEDIA_ROOT/p['media']) for p in slice_ if p['media']], collage_tmp)
+
+    kb = InlineKeyboardBuilder()
+    for idx in range(1, len(slice_)+1):
+        kb.button(text=str(idx), callback_data=f"sel_{idx}")
+    if page > 1:            kb.button("◀️", callback_data="prev")
+    if page*9 < len(items): kb.button("▶️", callback_data="next")
+    kb.adjust(3)
+
+    await bot.send_photo(chat_id, FSInputFile(collage_tmp),
+                         caption=f"Страница {page}", reply_markup=kb.as_markup())
+    await state.set_state(CatalogState.page)
+
+# (остальная логика: выбор товара, корзина, заказ, админ-панель, …)
+@dp.callback_query(lambda c: c.data.startswith("sel_"), StateFilter(CatalogState.page))
+async def on_select_product(cb: types.CallbackQuery, state: FSMContext):
+    idx = int(cb.data.split("_")[1]) - 1
+    page = (await state.get_data())["page"]
+    products = db.get_products_list(PROJECT_ID)
+    gidx = (page - 1) * 9 + idx
+    if gidx >= len(products):
+        return await cb.answer("Неверный выбор", show_alert=True)
+
+    product = products[gidx]
+    caption = (
+        f"<b>{escape(product['name'])}</b>\n\n"
+        f"{escape(product['short_desc'])}\n\n"
+        f"{escape(product['full_desc'])}"
+    )
+    chat_id = cb.message.chat.id          # ← правильный получатель
+
+    if product["media"]:
+        await bot.send_photo(chat_id, FSInputFile(MEDIA_ROOT / product["media"]), caption=caption)
     else:
-        await bot.send_message(
-            c.from_user.id,
-            f"{p['name']}\n\n{p['full_desc']}"
-        )
-    kb = types.InlineKeyboardMarkup().add(
-        types.InlineKeyboardButton("➕ В корзину", callback_data=f"addcart_{p['id']}"),
-        types.InlineKeyboardButton("← Назад",    callback_data="back")
-    )
-    await bot.send_message(c.from_user.id, "Что дальше?", reply_markup=kb)
-    await c.answer()
+        await bot.send_message(chat_id, caption)
 
-@dp.callback_query_handler(lambda c: c.data=="back", state="*")
-async def on_back(c: types.CallbackQuery, state: FSMContext):
-    await send_catalog_page(c.from_user.id, state)
-    await c.answer()
+    # Инлайн-клавиатура
+    kb = InlineKeyboardBuilder()
+    if chat_id != ADMIN_CHAT:             # в каталоге админ-группы корзина не нужна
+        kb.button(text="➕ В корзину", callback_data=f"add_{product['id']}")
+    kb.button(text="← Назад", callback_data="back")
+    kb.adjust(1)
+    await bot.send_message(chat_id, "Что дальше?", reply_markup=kb.as_markup())
+    await cb.answer()
 
-# --- КОРЗИНА ---
 
-@dp.callback_query_handler(lambda c: c.data.startswith("addcart_"))
-async def on_addcart(c: types.CallbackQuery):
-    pid = int(c.data.split("_")[1])
-    add_to_cart(PROJECT_ID, c.from_user.id, pid)
-    kb = types.InlineKeyboardMarkup(row_width=2).add(
-        types.InlineKeyboardButton("🛒 Перейти в корзину", callback_data="view_cart"),
-        types.InlineKeyboardButton("← Продолжить покупки", callback_data="back")
-    )
-    await c.answer("✅ Товар добавлен")
-    await bot.send_message(c.from_user.id, "Что дальше?", reply_markup=kb)
+@dp.callback_query(lambda c: c.data == "back", StateFilter(CatalogState.page))
+async def back_to_catalog(cb: types.CallbackQuery, state: FSMContext):
+    """Возврат к текущей странице каталога (после просмотра товара)."""
+    await send_catalog_page(cb.message.chat.id, state)
+    await cb.answer()
 
-@dp.callback_query_handler(lambda c: c.data=="view_cart")
-async def on_view_cart(c: types.CallbackQuery, state: FSMContext):
-    items = get_cart_items(PROJECT_ID, c.from_user.id)
+# ─── Корзина ────────────────────────────────────────────────────────────────
+@dp.callback_query(lambda c: c.data.startswith("add_"))
+async def add_to_cart(cb: types.CallbackQuery):
+    """Добавляет выбранный товар в корзину (обработка нажатия '➕ В корзину')."""
+    product_id = int(cb.data.split("_")[1])
+    db.add_to_cart(PROJECT_ID, cb.message.chat.id, product_id)
+    # Клавиатура: перейти в корзину или обратно в каталог
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🛒 Корзина", callback_data="view_cart")
+    kb.button(text="← Каталог",  callback_data="back")
+    kb.adjust(1)
+    # Короткое уведомление о добавлении (всплывающее)
+    await cb.answer("✅ Товар добавлен")
+    # Дополнительно отправляем сообщение с вариантами действий
+    await bot.send_message(cb.message.chat.id, "Что дальше?", reply_markup=kb.as_markup())
+
+@dp.callback_query(lambda c: c.data == "view_cart")
+async def view_cart(cb: types.CallbackQuery):
+    """Показывает содержимое корзины."""
+    await show_cart(cb.message.chat.id, cb.message)
+
+@dp.callback_query(lambda c: c.data.startswith(("dec_", "inc_", "del_")))
+async def edit_cart(cb: types.CallbackQuery):
+    """Обрабатывает изменение количества товаров или удаление из корзины."""
+    action, cart_id_str = cb.data.split("_")
+    cart_id = int(cart_id_str)
+    items = db.get_cart_items(PROJECT_ID, cb.message.chat.id)
+    item = next((i for i in items if i["cart_id"] == cart_id), None)
+    if not item:
+        return await cb.answer("❌ Не найдено", show_alert=True)
+
+    # Уменьшение, увеличение или удаление позиции
+    if action == "del":
+        db.delete_cart_item(cart_id)
+    else:
+        new_qty = item["quantity"] + (1 if action == "inc" else -1)
+        db.update_cart_item(cart_id, new_qty)
+    await show_cart(cb.message.chat.id, cb.message)
+    await cb.answer()  # убираем индикатор загрузки
+
+async def show_cart(user_id: int, msg: types.Message | None = None):
+    """Отображает текущее содержимое корзины пользователя с кнопками управления."""
+    items = db.get_cart_items(PROJECT_ID, user_id)
     if not items:
-        kb = types.InlineKeyboardMarkup().add(
-            types.InlineKeyboardButton("← В каталог", callback_data="back")
-        )
-        await bot.send_message(c.from_user.id, "🛒 Корзина пуста.", reply_markup=kb)
+        # Корзина пуста
+        text = "🛒 Корзина пуста."
+        kb = InlineKeyboardBuilder()
+        kb.button(text="← Каталог", callback_data="back")
+        kb.adjust(1)
+        if msg:
+            await msg.edit_text(text, reply_markup=kb.as_markup())
+        else:
+            await bot.send_message(user_id, text, reply_markup=kb.as_markup())
         return
-    text = "🛒 Ваша корзина:\n"
-    total = 0
-    for it in items:
-        qty = it['quantity']
-        price = getattr(it, 'price', 0)
-        subtotal = price * qty
-        total += subtotal
-        text += f"{it['cart_id']}) {it['name']} × {qty} — {subtotal}₽\n"
-    text += f"\nИтого: {total}₽"
-    kb = types.InlineKeyboardMarkup(row_width=4)
-    for it in items:
-        cid = it['cart_id']
-        kb.insert(types.InlineKeyboardButton(f"➖{cid}", callback_data=f"dec_{cid}"))
-        kb.insert(types.InlineKeyboardButton(f"➕{cid}", callback_data=f"inc_{cid}"))
-        kb.insert(types.InlineKeyboardButton(f"🗑{cid}", callback_data=f"delcart_{cid}"))
-    kb.add(
-        types.InlineKeyboardButton("📦 Оформить заказ", callback_data="checkout"),
-        types.InlineKeyboardButton("← В каталог", callback_data="back")
-    )
-    await bot.send_message(c.from_user.id, text, reply_markup=kb)
 
-@dp.callback_query_handler(lambda c: c.data.startswith(("dec_","inc_","delcart_")))
-async def on_edit_cart(c: types.CallbackQuery):
-    action, cid = c.data.split("_")
-    cid = int(cid)
-    items = get_cart_items(PROJECT_ID, c.from_user.id)
-    if action == "dec":
-        q = next(it['quantity'] for it in items if it['cart_id']==cid)
-        update_cart_item(cid, q-1)
-    elif action == "inc":
-        q = next(it['quantity'] for it in items if it['cart_id']==cid)
-        update_cart_item(cid, q+1)
+    # Формируем список позиций в тексте
+    lines = ["<b>Ваши товары:</b>"]
+    kb = InlineKeyboardBuilder()
+    for it in items:
+        lines.append(f"{escape(it['name'])} — {it['quantity']} шт.")
+        cid = it["cart_id"]
+        # Кнопки "-" "+" "❌" для каждой позиции
+        kb.button(text="➖", callback_data=f"dec_{cid}")
+        kb.button(text="➕", callback_data=f"inc_{cid}")
+        kb.button(text="❌", callback_data=f"del_{cid}")
+    # Кнопки оформления заказа и возврата в каталог
+    kb.button(text="✅ Оформить", callback_data="checkout")
+    kb.button(text="← Каталог",   callback_data="back")
+    # Располагаем: по 3 кнопки (управление) в ряд для каждой позиции, затем отдельные ряды для оформления и возврата
+    kb.adjust(3, 3, 1, 1)
+    # Обновляем сообщение о корзине (или отправляем новое)
+    if msg:
+        await msg.edit_text("\n".join(lines), reply_markup=kb.as_markup())
     else:
-        delete_cart_item(cid)
-    await on_view_cart(c, None)
-    await c.answer()
+        await bot.send_message(user_id, "\n".join(lines), reply_markup=kb.as_markup())
 
-@dp.callback_query_handler(lambda c: c.data=="checkout")
-async def on_checkout(c: types.CallbackQuery, state: FSMContext):
-    await bot.send_message(c.from_user.id, "Введите адрес доставки:")
-    await CartState.checkout_address.set()
-    await c.answer()
+# ─── Оформление заказа ──────────────────────────────────────────────────────
+@dp.callback_query(lambda c: c.data == "checkout")
+async def checkout(cb: types.CallbackQuery, state: FSMContext):
+    """Начинает оформление заказа: запрашивает адрес доставки."""
+    # Заменяем текст сообщения корзины на приглашение ввести адрес
+    await cb.message.edit_text("Введите адрес доставки:")
+    await state.set_state(CartState.checkout_address)
+    await cb.answer()
 
-@dp.message_handler(state=CartState.checkout_address)
-async def handle_address(msg: types.Message, state: FSMContext):
-    await state.update_data(address=msg.text)
-    await msg.answer("Прикрепите фото/документ или напишите «нет»:")
-    await CartState.checkout_media.set()
+@dp.message(StateFilter(CartState.checkout_address))
+async def checkout_address(m: types.Message, state: FSMContext):
+    # Сохраняем адрес
+    await state.update_data(address=m.text.strip())
 
-@dp.message_handler(
-    state=CartState.checkout_media,
-    content_types=types.ContentTypes.ANY
-)
-async def handle_checkout_media(msg: types.Message, state: FSMContext):
-    media = None
-    if msg.content_type in ['photo','document']:
-        if msg.content_type == 'photo':
-            file_id = msg.photo[-1].file_id
-            orig_name = f"{file_id}.jpg"
-            file_obj = await bot.get_file(file_id)  # type: ignore
-            data_bytes = await bot.download_file(file_obj.file_path)  # type: ignore
-        else:
-            file_id = msg.document.file_id
-            orig_name = msg.document.file_name
-            file_obj = await bot.get_file(file_id)  # type: ignore
-            data_bytes = await bot.download_file(file_obj.file_path)  # type: ignore
-        path = save_media_file(
-            project_id=PROJECT_ID,
-            file_bytes=data_bytes,
-            original_filename=orig_name,
-            media_root=Path(__file__).parent.parent / "media"
-        )
-        media = path.name
-    await state.update_data(media=media)
+    # Сразу предлагаем подтвердить заказ
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Подтвердить", callback_data="confirm")
+    kb.button(text="❌ Отменить",    callback_data="cancel")
+    kb.adjust(2)
+
+    await m.answer("<b>Подтвердите заказ</b>", reply_markup=kb.as_markup())
+    await state.set_state(CartState.checkout_confirm)
+
+
+
+@dp.callback_query(lambda c: c.data == "confirm", StateFilter(CartState.checkout_confirm))
+async def confirm_order(cb: types.CallbackQuery, state: FSMContext):
+    """Обрабатывает подтверждение заказа пользователем."""
     data = await state.get_data()
-    items = get_cart_items(PROJECT_ID, msg.from_user.id)
-    text = "✅ Подтвердите заказ:\n"
-    total = 0
-    for it in items:
-        qty = it['quantity']
-        price = getattr(it, 'price', 0)
-        subtotal = price * qty
-        total += subtotal
-        text += f"{it['name']} × {qty} — {subtotal}₽\n"
-    text += f"\nАдрес: {data['address']}\nИтого: {total}₽"
-    kb = types.InlineKeyboardMarkup().add(
-        types.InlineKeyboardButton("✅ Подтвердить", callback_data="confirm_order"),
-        types.InlineKeyboardButton("❌ Отменить",    callback_data="cancel_order")
-    )
-    await msg.answer(text, reply_markup=kb)
-    await CartState.checkout_confirm.set()
+    user_id = cb.from_user.id
+    address = data.get("address", "")
+    media_file = data.get("media", "")  # имя сохранённого файла (может быть пустой)
 
-@dp.callback_query_handler(
-    lambda c: c.data in ["confirm_order","cancel_order"],
-    state=CartState.checkout_confirm
-)
-async def on_confirm_order(c: types.CallbackQuery, state: FSMContext):
-    if c.data == "cancel_order":
-        await bot.send_message(c.from_user.id, "❌ Оформление отменено")
-        clear_cart(PROJECT_ID, c.from_user.id)
-        return await state.finish()
-    data = await state.get_data()
-    items = get_cart_items(PROJECT_ID, c.from_user.id)
+    # Получаем текущее содержимое корзины пользователя и сохраняем каждую позицию как заказ
+    items = db.get_cart_items(PROJECT_ID, user_id)
     for it in items:
-        save_order({
+        order = {
             "project_id": PROJECT_ID,
-            "user_id":    c.from_user.id,
-            "product":    it['name'],
-            "quantity":   it['quantity'],
-            "address":    data['address'],
-            "media_path": data.get('media')
-        })
-    clear_cart(PROJECT_ID, c.from_user.id)
-    await bot.send_message(c.from_user.id, "✅ Заказ оформлен!")
-    await state.finish()
+            "user_id":    user_id,
+            "product":    it["product_id"],
+            "quantity":   it["quantity"],
+            "address":    address,
+            "media_path": media_file
+        }
+        db.save_order(order)
+    db.clear_cart(PROJECT_ID, user_id)  # очищаем корзину пользователя
 
-# --- АДМИН: добавить/удалить товар ---
+    # Уведомляем пользователя об успешном оформлении
+    await cb.message.edit_text("✅ Заказ оформлен!")
+    # Сброс состояния FSM
+    await state.clear()
 
-@dp.message_handler(commands=['addproduct'])
-async def cmd_addproduct(msg: types.Message):
-    if msg.chat.id != ADMIN_CHAT: return
-    await msg.answer("🆕 Введите название товара:")
-    await ProductAdminState.name.set()
+    # Отправляем уведомление в админ-группу о новом заказе
+    try:
+        user = cb.from_user
+        # Формируем сообщение с информацией о заказе
+        order_lines = [f"<b>Новый заказ от</b> <a href=\"tg://user?id={user.id}\">{escape(user.first_name)}</a>:"]
+        for it in items:
+            order_lines.append(f"{escape(it['name'])} — {it['quantity']} шт.")
+        order_lines.append(f"<b>Адрес:</b> {escape(address)}")
+        if media_file:
+            order_lines.append("(К заказу приложен файл ниже)")
+        admin_message = "\n".join(order_lines)
+        # Отправляем текстовое сообщение с деталями заказа
+        await bot.send_message(ADMIN_CHAT, admin_message)
+        # Если есть вложенный файл от пользователя, отправляем его в группу
+        if media_file:
+            file_path = MEDIA_ROOT / media_file
+            ext = file_path.suffix.lower()
+            # Определяем тип медиа и используем соответствующий метод отправки
+            if ext in {".jpg", ".jpeg", ".png", ".gif"}:
+                if ext == ".gif":
+                    await bot.send_animation(ADMIN_CHAT, FSInputFile(file_path))
+                else:
+                    await bot.send_photo(ADMIN_CHAT, FSInputFile(file_path))
+            elif ext == ".mp4":
+                await bot.send_video(ADMIN_CHAT, FSInputFile(file_path))
+            elif ext == ".mp3":
+                await bot.send_audio(ADMIN_CHAT, FSInputFile(file_path))
+            else:
+                await bot.send_document(ADMIN_CHAT, FSInputFile(file_path))
+    except Exception as err:
+        # Логируем ошибку отправки уведомления (если бот не имеет прав писать в группу и т.п.)
+        print(f"[WARN] Не удалось отправить уведомление в админ-группу: {err}")
 
-@dp.message_handler(state=ProductAdminState.name)
-async def prod_name(msg: types.Message, state: FSMContext):
-    text = msg.text.strip()
-    if not text:
-        return await state.finish()
-    await state.update_data(name=text)
-    await msg.answer("📋 Введите короткое описание:")
-    await ProductAdminState.short_desc.set()
+@dp.callback_query(lambda c: c.data == "cancel", StateFilter(CartState.checkout_confirm))
+async def cancel_order(cb: types.CallbackQuery, state: FSMContext):
+    """Отмена процесса оформления заказа."""
+    await cb.message.edit_text("❌ Оформление отменено.")
+    await state.clear()
 
-@dp.message_handler(state=ProductAdminState.short_desc)
-async def prod_short(msg: types.Message, state: FSMContext):
-    text = msg.text.strip()
-    if not text:
-        return await state.finish()
-    await state.update_data(short_desc=text)
-    await msg.answer("📝 Введите полное описание или «нет»:")
-    await ProductAdminState.full_desc.set()
+# ─── Админ-панель: добавление товара ─────────────────────────────────────────
+@dp.message(Command("addproduct"))
+async def adm_add_product(message: types.Message, state: FSMContext):
+    """Начинает диалог добавления нового товара (только в ADMIN_CHAT)."""
+    if message.chat.id != ADMIN_CHAT:
+        return  # игнорируем команду, если она не из админской группы
+    await message.answer("Название товара:")
+    await state.set_state(ProductAdminState.name)
 
-@dp.message_handler(state=ProductAdminState.full_desc)
-async def prod_full(msg: types.Message, state: FSMContext):
-    text = msg.text.strip()
-    if not text:
-        return await state.finish()
-    full = "" if text.lower() == "нет" else text
-    await state.update_data(full_desc=full)
-    await msg.answer("📷 Прикрепите фото/видео или «нет»:")
-    await ProductAdminState.waiting_img.set()
+@dp.message(StateFilter(ProductAdminState.name))
+async def adm_enter_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    await message.answer("Краткое описание:")
+    await state.set_state(ProductAdminState.short_desc)
 
-@dp.message_handler(
-    state=ProductAdminState.waiting_img,
-    content_types=types.ContentTypes.ANY
-)
-async def prod_media(msg: types.Message, state: FSMContext):
-    media_path = ""
-    if msg.content_type in ['photo','document','video']:
-        if msg.content_type == 'photo':
-            file_id = msg.photo[-1].file_id
-            orig_name = f"{file_id}.jpg"
-            file_obj = await bot.get_file(file_id)  # type: ignore
-            data_bytes = await bot.download_file(file_obj.file_path)  # type: ignore
-        else:
-            file_id = msg.document.file_id
-            orig_name = msg.document.file_name
-            file_obj = await bot.get_file(file_id)  # type: ignore
-            data_bytes = await bot.download_file(file_obj.file_path)  # type: ignore
-        path = save_media_file(
-            project_id=PROJECT_ID,
-            file_bytes=data_bytes,
-            original_filename=orig_name,
-            media_root=Path(__file__).parent.parent / "media"
-        )
-        media_path = path.name
-    elif msg.text.lower() == "нет":
-        media_path = ""
+@dp.message(StateFilter(ProductAdminState.short_desc))
+async def adm_enter_short_desc(message: types.Message, state: FSMContext):
+    await state.update_data(short_desc=message.text.strip())
+    await message.answer("Полное описание:")
+    await state.set_state(ProductAdminState.full_desc)
+
+@dp.message(StateFilter(ProductAdminState.full_desc))
+async def adm_enter_full_desc(message: types.Message, state: FSMContext):
+    await state.update_data(full_desc=message.text.strip())
+    await message.answer("Пришлите картинку для товара (или напишите «нет»):")
+    await state.set_state(ProductAdminState.waiting_img)
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: types.Message):
+    if message.chat.id != ADMIN_CHAT:
+        return
+    # ожидаем: /ban <user_id>
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return await message.reply("Использование: /ban <user_id>")
+    target_id = int(parts[1])
+    db.ban_user(PROJECT_ID, target_id)
+    await message.reply(f"❌ Пользователь {target_id} заблокирован.")
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: types.Message):
+    if message.chat.id != ADMIN_CHAT:
+        return
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return await message.reply("Использование: /unban <user_id>")
+    target_id = int(parts[1])
+    db.unban_user(PROJECT_ID, target_id)
+    await message.reply(f"✅ Пользователь {target_id} разблокирован.")
+
+@dp.message(StateFilter(ProductAdminState.waiting_img))
+async def adm_enter_image(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    media_filename = ""
+    if message.text and message.text.lower() == "нет":
+        media_filename = ""
     else:
-        return await state.finish()
-    data = await state.get_data()
-    pid = add_product(
-        PROJECT_ID,
-        data['name'], data['short_desc'], data['full_desc'], media_path
-    )
-    await msg.answer(f"✅ Товар #{pid} добавлен.")
-    await state.finish()
+        file = None
+        orig_name = ""
+        # Определяем тип полученного медиа-файла
+        if message.photo:
+            file = message.photo[-1]
+            orig_name = "product.jpg"
+        elif message.video:
+            file = message.video
+            orig_name = message.video.file_name or "product.mp4"
+        elif message.document:
+            file = message.document
+            orig_name = message.document.file_name or f"file{Path(file.file_id).suffix or ''}"
+        elif message.audio:
+            file = message.audio
+            orig_name = message.audio.file_name or "product.mp3"
+        if file:
+            file_bytes = await bot.download(file)
+            try:
+                saved_path = save_media_file(PROJECT_ID, file_bytes.getvalue(), orig_name)
+                media_filename = saved_path.name
+            except ValueError as e:
+                await message.answer(f"⚠️ Файл не сохранён: {e}\nТовар будет добавлен без изображения.")
+                media_filename = ""
+        else:
+            media_filename = ""
+    # Добавляем товар в базу данных
+    db.add_product(PROJECT_ID, data["name"], data["short_desc"], data["full_desc"], media_filename)
+    await message.answer("✅ Товар успешно добавлен.")
+    await state.clear()
 
-@dp.message_handler(commands=['delproduct'])
-async def cmd_delproduct(msg: types.Message, state: FSMContext):
-    if msg.chat.id != ADMIN_CHAT: return
+# ─── Админ-панель: удаление товара ───────────────────────────────────────────
+@dp.message(Command("delproduct"))
+async def adm_delete_product_start(message: types.Message, state: FSMContext):
+    """Начинает процесс удаления товара: показывает каталог товаров с номерами для удаления."""
+    if message.chat.id != ADMIN_CHAT:
+        return
     await state.update_data(del_page=1)
-    await send_delete_page(msg.chat.id, state)
-    await DeleteProductState.selecting_page.set()
+    await send_delete_page(message.chat.id, state)
 
-async def send_delete_page(chat_id, state: FSMContext):
+@dp.callback_query(lambda c: c.data in {"dprev", "dnext"}, StateFilter(DeleteProductState.selecting_page))
+async def adm_delete_nav(cb: types.CallbackQuery, state: FSMContext):
+    """Листает страницы каталога при удалении товара (в админ-панели)."""
     data = await state.get_data()
-    page = data.get('del_page', 1)
-    prods = get_products_list(PROJECT_ID)
-    slice = prods[(page-1)*9 : page*9]
-    paths = []
-    for p in slice:
-        media = p["media"]
-        if media:
-            paths.append(str(Path(__file__).parent.parent / "media" / str(PROJECT_ID) / media))
-    collage = generate_collage(paths, f"/tmp/del_{page}.jpg")
-    kb = types.InlineKeyboardMarkup(row_width=3)
-    for i in range(len(slice)):
-        kb.insert(types.InlineKeyboardButton(str(i+1), callback_data=f"del_sel_{i+1}"))
-    if page > 1:
-        kb.insert(types.InlineKeyboardButton("←", callback_data="del_prev"))
-    if page * 9 < len(prods):
-        kb.insert(types.InlineKeyboardButton("→", callback_data="del_next"))
-    await bot.send_photo(chat_id, collage, caption="Выберите товар для удаления:", reply_markup=kb)
-
-@dp.callback_query_handler(lambda c: c.data in ["del_prev","del_next"], state=DeleteProductState.selecting_page)
-async def on_del_nav(c: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    page = data.get('del_page', 1)
-    prods = get_products_list(PROJECT_ID)
-    if c.data == "del_prev" and page > 1:
+    page = data.get("del_page", 1)
+    products = db.get_products_list(PROJECT_ID)
+    if cb.data == "dprev" and page > 1:
         page -= 1
-    if c.data == "del_next" and page * 9 < len(prods):
+    elif cb.data == "dnext" and page * 9 < len(products):
         page += 1
     await state.update_data(del_page=page)
-    await send_delete_page(c.from_user.id, state)
-    await c.answer()
+    await send_delete_page(cb.message.chat.id, state)
+    await cb.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("del_sel_"), state=DeleteProductState.selecting_page)
-async def on_del_select(c: types.CallbackQuery, state: FSMContext):
-    idx = int(c.data.split("_")[-1]) - 1
+async def send_delete_page(chat_id: int, state: FSMContext):
+    """Отправляет страницу каталога товаров с пронумерованными позициями для удаления."""
+    page = (await state.get_data()).get("del_page", 1)
+    products = db.get_products_list(PROJECT_ID)
+    slice_ = products[(page - 1) * 9 : page * 9]
+
+    # Генерируем коллаж для страницы удаляемых товаров
+    collage_path = Path(tempfile.gettempdir()) / f"delete_{page}.jpg"
+    generate_collage([str(MEDIA_ROOT / p["media"]) for p in slice_ if p["media"]], collage_path)
+
+    kb = InlineKeyboardBuilder()
+    for idx, _ in enumerate(slice_, start=1):
+        kb.button(text=str(idx), callback_data=f"dsel_{idx}")
+    if page > 1:
+        kb.button(text="◀️", callback_data="dprev")
+    if page * 9 < len(products):
+        kb.button(text="▶️", callback_data="dnext")
+    kb.adjust(3)
+    await bot.send_photo(chat_id, FSInputFile(collage_path),
+                         caption="Выберите товар для удаления:", reply_markup=kb.as_markup())
+    await state.set_state(DeleteProductState.selecting_page)
+
+@dp.callback_query(lambda c: c.data.startswith("dsel_"), StateFilter(DeleteProductState.selecting_page))
+async def adm_select_delete(cb: types.CallbackQuery, state: FSMContext):
+    """Фиксирует выбор товара для удаления и просит подтверждение/отмену."""
+    idx = int(cb.data.split("_")[1]) - 1
+    page = (await state.get_data())["del_page"]
+    products = db.get_products_list(PROJECT_ID)
+    global_idx = (page - 1) * 9 + idx
+    if global_idx >= len(products):
+        return await cb.answer("Неверно", show_alert=True)
+    product_id = products[global_idx]["id"]
+    await state.update_data(del_id=product_id)
+    # Запрашиваем подтверждение удаления
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Удалить", callback_data="dconfirm")
+    kb.button(text="❌ Отмена",  callback_data="dcancel")
+    kb.adjust(2)
+    await cb.message.edit_caption(f"Выбран товар #{product_id}. Подтвердите удаление.", reply_markup=kb.as_markup())
+    await state.set_state(DeleteProductState.confirming_delete)
+    await cb.answer()
+
+@dp.callback_query(lambda c: c.data == "dconfirm", StateFilter(DeleteProductState.confirming_delete))
+async def adm_delete_confirm(cb: types.CallbackQuery, state: FSMContext):
+    """Удаляет товар из базы (после подтверждения админом)."""
     data = await state.get_data()
-    page = data['del_page']
-    prods = get_products_list(PROJECT_ID)
-    global_idx = (page-1)*9 + idx
-    if global_idx >= len(prods):
-        return await c.answer("Неверный выбор", show_alert=True)
-    p = prods[global_idx]
-    await state.update_data(del_id=p['id'])
-    kb = types.InlineKeyboardMarkup().add(
-        types.InlineKeyboardButton("✅ Подтвердить", callback_data="del_confirm"),
-        types.InlineKeyboardButton("❌ Отмена",    callback_data="del_cancel")
-    )
-    await bot.send_message(c.from_user.id, f"Удалить «{p['name']}»?", reply_markup=kb)
-    await DeleteProductState.confirming_delete.set()
-    await c.answer()
+    product_id = data.get("del_id")
+    # Удаляем товар из базы данных
+    db.delete_product(PROJECT_ID, product_id)
+    await cb.message.edit_caption(f"✅ Товар #{product_id} удалён.", reply_markup=None)
+    await state.clear()
 
-@dp.callback_query_handler(lambda c: c.data=="del_confirm", state=DeleteProductState.confirming_delete)
-async def on_del_confirm(c: types.CallbackQuery, state: FSMContext):
-    pid = (await state.get_data())['del_id']
-    delete_product(PROJECT_ID, pid)
-    await bot.send_message(c.from_user.id, f"✅ Товар #{pid} удалён.")
-    await state.finish()
+@dp.callback_query(lambda c: c.data == "dcancel", StateFilter(DeleteProductState.confirming_delete))
+async def adm_delete_cancel(cb: types.CallbackQuery, state: FSMContext):
+    """Отмена удаления товара."""
+    await cb.message.edit_caption("❌ Удаление отменено.", reply_markup=None)
+    await state.clear()
 
-@dp.callback_query_handler(lambda c: c.data=="del_cancel", state=DeleteProductState.confirming_delete)
-async def on_del_cancel(c: types.CallbackQuery, state: FSMContext):
-    await bot.send_message(c.from_user.id, "❌ Удаление отменено.")
-    await state.finish()
 
-if __name__ == '__main__':
-    executor.start_polling(dp)
-{% endraw %}
+# --- регистрация команд ---
+async def setup_bot_commands(b: Bot):
+    default = [BotCommand("start", "Показать каталог товаров")]
+    await b.set_my_commands(default, scope=BotCommandScopeDefault())
+    await b.set_my_commands(default, scope=BotCommandScopeAllPrivateChats())
+    await b.set_my_commands(default, scope=BotCommandScopeAllGroupChats())
+
+    admin_extra = [
+        BotCommand("addproduct", "Добавить товар"),
+        BotCommand("delproduct", "Удалить товар"),
+        BotCommand("ban",        "Бан пользователя"),
+        BotCommand("unban",      "Разбан пользователя"),
+    ]
+    await b.set_my_commands(default+admin_extra,
+                            scope=BotCommandScopeChat(chat_id=ADMIN_CHAT))
+
+# ──────────────────────────── запуск ───────────────────────────────────
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    async def _startup():
+        await setup_bot_commands(bot)
+    dp.run_polling(bot, skip_updates=True, startup=[_startup])

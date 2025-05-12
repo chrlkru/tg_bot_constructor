@@ -1,3 +1,4 @@
+# backend/app/main.py
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -5,17 +6,50 @@ from jinja2 import Environment, FileSystemLoader
 from pathlib import Path
 from zipfile import ZipFile
 from typing import List
-from app.database import init_db, create_project, get_projects, DB_PATH
-from app.export_utils import build_single_project_db
+
+from app.database      import init_db, create_project, get_projects, DB_PATH
+from app.export_utils  import build_single_project_db
+from app.schemas       import ProjectCreate
+from app.utils.media   import save_media_file, list_media_files
 
 import shutil
 import os
 import json
 
+# вместо "from utils import order_db" и пр.:
+from app.utils         import order_db as dbё
+from app.utils.collage import generate_collage
 
-from app.schemas import ProjectCreate
-
-from app.utils.media import save_media_file, list_media_files
+# --- какие utils нужны какому боту ---------------------------------
+BOT_UTILS = {
+    "order_bot": [
+        "utils/order_db.py",
+        "utils/collage.py",
+        "utils/media.py",
+    ],
+    "faq_bot": [
+        "utils/faq_db.py",
+        "utils/media.py",
+    ],
+    "helper_bot": [
+        "utils/helper_db.py",
+        "utils/media.py",
+    ],
+    "feedback_bot": [
+        "utils/feedback_db.py",
+    ],
+    "moderator_bot": [
+        "utils/moderator_db.py",
+    ],
+    "quiz_bot": [                     # у квиза БД нет
+        "utils/media.py",             # только скачивание картинок для вопросов
+    ],
+    "smart_booking_crm": [
+        "utils/booking_db.py",
+        "utils/inline_calendar.py",
+        "utils/media.py",
+    ],
+}
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -30,7 +64,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Инициализируем БД
+# инициализируем основную БД конструктора
 init_db()
 
 @app.get("/")
@@ -38,9 +72,7 @@ def root():
     return {"message": "Сервер конструктора Telegram-ботов запущен"}
 
 @app.post("/projects")
-async def create_new_project(
-    project: str = Form(...)
-):
+async def create_new_project(project: str = Form(...)):
     """
     Ожидает JSON-представление проекта в поле Form 'project'.
     """
@@ -59,8 +91,8 @@ async def upload_media(
     files: List[UploadFile] = File(...)
 ):
     """
-    Загружает медиа-файлы для проекта через общую утилиту save_media_file.
-    Кладёт их в media/{project_id}/, возвращает список имён сохранённых файлов.
+    Загружает медиа-файлы для проекта через save_media_file.
+    Кладёт их в media/{project_id}/, возвращает список имён.
     """
     project = get_projects(project_id)
     if not project:
@@ -85,7 +117,7 @@ async def upload_media(
 @app.get("/projects/{project_id}/media")
 def list_media(project_id: int):
     """
-    Возвращает список загруженных для проекта media-файлов.
+    Возвращает список загруженных для проекта медиа-файлов.
     """
     project = get_projects(project_id)
     if not project:
@@ -96,8 +128,7 @@ def list_media(project_id: int):
 @app.get("/projects/{project_id}/export")
 def export_bot(project_id: int):
     """
-    Генерирует исходники бота из шаблона + медиа + служебные файлы,
-    упаковывает в ZIP и возвращает FileResponse.
+    Генерирует исходники бота, запаковывает в ZIP и возвращает FileResponse.
     """
     project = get_projects(project_id)
     if not project:
@@ -105,103 +136,101 @@ def export_bot(project_id: int):
 
     template_type = project["template_type"]
     template_path = BASE_DIR / "templates" / template_type
-
     if not template_path.exists():
         raise HTTPException(status_code=404, detail="Шаблон не найден")
 
+    # временная папка для сборки
     export_dir = BASE_DIR / "exports" / f"project_{project_id}"
     if export_dir.exists():
         shutil.rmtree(export_dir)
     export_dir.mkdir(parents=True)
 
-    # 1) Рендер .j2 → .py
+    # 1) Рендерим все *.j2 → *.py
     env = Environment(loader=FileSystemLoader(str(template_path)))
+    jinja_ctx = {
+        "project_id": project_id,
+        "admin_chat_id": project["content"].get("admin_chat_id", 0),
+        "project": project,
+    }
     for tpl in template_path.glob("*.j2"):
-        tpl_obj = env.get_template(tpl.name)
-        rendered = tpl_obj.render(project=project)
-        out_name = tpl.name[:-3]
-        (export_dir / out_name).write_text(rendered, encoding="utf-8")
+        rendered = env.get_template(tpl.name).render(**jinja_ctx)
+        (export_dir / tpl.stem).write_text(rendered, encoding="utf-8")
+
 
     # 2) .env
     (export_dir / ".env").write_text(f"TOKEN={project['token']}\n", encoding="utf-8")
 
     # 3) requirements.txt
-    deps = [
-        "aiogram",
-        "python-dotenv",
-        "Pillow",
-        "openpyxl",
-        "apscheduler"
-    ]
+    deps = ["aiogram", "python-dotenv", "Pillow", "openpyxl", "apscheduler"]
     (export_dir / "requirements.txt").write_text("\n".join(deps), encoding="utf-8")
 
     # 4) README.md
-    readme = export_dir / "README.md"
-    readme.write_text(
+    (export_dir / "README.md").write_text(
         f"# {project['name']}\n\n"
-        f"{project['description']}\n\n"
+        f"{project.get('description','')}\n\n"
         "## Как запустить бота:\n"
         "```bash\n"
         "pip install -r requirements.txt\n"
-        "python bot.py\n"
+        "python run.py\n"
         "```\n",
         encoding="utf-8"
     )
 
-    # 5) run.py
+    # 5) run.py — единый entry-point для всех шаблонов
     run_py = export_dir / "run.py"
     run_py.write_text(
         "\n".join([
+            "#!/usr/bin/env python3",
+            "import logging",
             "import os",
-            "import subprocess",
-            "import sys",
+            "import asyncio",
+            "from dotenv import load_dotenv",
             "",
-            "def install_requirements():",
-            "    try:",
-            "        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt'])",
-            "    except subprocess.CalledProcessError as e:",
-            "        print('Ошибка при установке зависимостей:', e)",
-            "        sys.exit(1)",
+            "# 1) Логирование",
+            "logging.basicConfig(",
+            "    level    = logging.INFO,",
+            "    format   = \"%Y-%m-%d %H:%M:%S [%(levelname)s] %(name)s: %(message)s\"",
+            ")",
+            "logging.getLogger(\"aiogram\").setLevel(logging.DEBUG)",
             "",
-            "def run_bot():",
-            "    from aiogram import Bot, Dispatcher, executor, types",
-            "    from dotenv import load_dotenv",
+            "# 2) Импорт бота из сгенерированного модуля",
+            f"from {template_type} import bot, dp, setup_bot_commands",
             "",
+            "async def main():",
             "    load_dotenv()",
-            "    bot = Bot(token=os.getenv('TOKEN'))",
-            "    dp = Dispatcher(bot)",
-            "",
-            "    @dp.message_handler(commands=['start'])",
-            "    async def start(message: types.Message):",
-            "        await message.answer('Бот запущен и готов к работе!')",
-            "",
-            "    executor.start_polling(dp)",
+            "    # регистрируем команды у бота",
+            "    await setup_bot_commands(bot)",
+            "    # и стартуем polling",
+            "    await dp.start_polling(bot, skip_updates=True)",
             "",
             "if __name__ == '__main__':",
-            "    install_requirements()",
-            "    run_bot()",
+            "    asyncio.run(main())",
         ]),
         encoding="utf-8"
     )
 
-    # 6) Копируем медиа через shutil (util используется при загрузке)
+    # 6) Копируем медиа
     media_src = BASE_DIR / "media" / str(project_id)
     if media_src.exists():
         shutil.copytree(media_src, export_dir / "media")
 
-    # 7) Добавляем Windows-скрипты для удобства запуск/остановки
-    start_bat = export_dir / "start_bot.bat"
-    start_bat.write_text(r'''@echo off
+    # 7) Генерируем Windows-скрипты
+    # 7.1) start_bot.bat
+    (export_dir / "start_bot.bat").write_text(r'''@echo off
+pushd %~dp0
 pip install -r requirements.txt
-start "" /B python bot.py > bot.log 2>&1
-for /f "tokens=2" %%a in ('tasklist /FI "IMAGENAME eq python.exe" /FO LIST /V ^| findstr /R /C:"Window Title: bot.py"') do set BOT_PID=%%a
+start "" /B python run.py > bot.log 2>&1
+for /f "tokens=2" %%a in ('
+    tasklist /FI "IMAGENAME eq python.exe" /FO LIST /V 
+    ^| findstr /R /C:"Window Title: run.py"
+') do set BOT_PID=%%a
 echo %BOT_PID% > bot.pid
 echo Bot started. PID=%BOT_PID%, logs→bot.log
-pause
+cmd /k rem
 ''', encoding="utf-8")
 
-    stop_bat = export_dir / "stop_bot.bat"
-    stop_bat.write_text(r'''@echo off
+    # 7.2) stop_bot.bat
+    (export_dir / "stop_bot.bat").write_text(r'''@echo off
 if not exist bot.pid (
   echo bot.pid not found. Bot may not be running.
   pause
@@ -218,29 +247,40 @@ del bot.pid
 pause
 ''', encoding="utf-8")
 
-    # 6-bis) Копируем все утилиты (включая dp.py) из app/utils → export_dir/utils
-    shutil.copytree(
-        BASE_DIR / "app" / "utils",
-        export_dir / "utils",
-    )
-    (export_dir / "utils" / "__init__.py").touch(exist_ok=True)
+    # 8) Копируем утилиты конструктора только нужные файлы
+    bot_name = template_type  # или project["template_name"], если ты действительно так называешь
+    utils_dir = export_dir / "utils"
+    utils_dir.mkdir(parents=True, exist_ok=True)
 
-    # 6-ter) Генерируем базу для бота с записями только этого проекта
-    tmp_db = build_single_project_db(
-        src_db=DB_PATH,
-        schema_db=BASE_DIR / "app" / "schema.db",
-        project_id=project_id
-    )
-    shutil.copy(tmp_db, export_dir / "utils" / "database.db")
+    for rel_path in BOT_UTILS.get(bot_name, []):
+        src = BASE_DIR / rel_path
+        dst = export_dir / rel_path
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(src, dst)
+
+    # 9) Генерируем отдельную БД только для этого проекта
+    tmp_db = build_single_project_db(project_id)
+
+    db_name = {
+        "order_bot": "order_bot.db",
+        "faq_bot": "faq_bot.db",
+        "helper_bot": "helper_bot.db",
+        "moderator_bot": "moderator_bot.db",
+        "feedback_bot": "feedback_bot.db",
+        "smart_booking_crm": "booking_bot.db",
+    }.get(template_type, "database.db")  # fallback для старых шаблонов
+
+    shutil.copy(tmp_db, export_dir / "utils" / db_name)
     tmp_db.unlink()
 
-    # 8) Упаковка в ZIP
+    # 10) Упаковываем в ZIP и возвращаем
     zip_path = BASE_DIR / "exports" / f"project_{project_id}.zip"
     with ZipFile(zip_path, "w") as zipf:
         for file in export_dir.rglob("*"):
             zipf.write(file, arcname=file.relative_to(export_dir))
 
     shutil.rmtree(export_dir)
+
     return FileResponse(
         path=str(zip_path),
         filename=f"{project['name']}.zip",
