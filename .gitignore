@@ -24,7 +24,7 @@ venv/
 # ==== Backend project ====
 /backend/.env
 /backend/**/*.db
-/backend/app/exports/
+/backend/app/exports/**
 
 /backend/.idea/
 
