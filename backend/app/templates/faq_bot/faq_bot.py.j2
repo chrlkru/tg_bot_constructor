@@ -1,253 +1,450 @@
+import logging
 import os
-from aiogram import Bot, Dispatcher, executor, types
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
 from pathlib import Path
 from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat, FSInputFile
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from utils.faq_db import get_faq_entries, add_faq_entry, delete_faq_entry
+from utils.media import save_media_file, delete_media_file
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command
 
-from utils.dp import (
-    transaction,
-    safe_execute,
-    get_faq_entries,
-    add_faq_entry,
-    delete_faq_entry
-)
-from utils.media import save_media_file
 
+# Загрузка переменных окружения (.env)
 load_dotenv()
-BOT_TOKEN = os.getenv("TOKEN")
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
-storage = MemoryStorage()
-dp = Dispatcher(bot, storage=storage)
+BOT_TOKEN = os.getenv("TOKEN") or ""
+if not BOT_TOKEN:
+    raise RuntimeError("Не задан токен Telegram-бота (переменная окружения TOKEN)")
 
-PROJECT_ID = {{ project.id }}
-ADMIN_CHAT = {{ project.content.admin_chat_id }}
+# Константы проекта
+PROJECT_ID = {{ project_id }}        # ID проекта (для разделения данных FAQ в БД)
+ADMIN_CHAT = {{ admin_chat_id }}     # ID чата администратора (или группы)
 
-# — FSM-состояния —
+# Инициализация бота и диспетчера
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+dp = Dispatcher(storage=MemoryStorage())
+scheduler = AsyncIOScheduler()  # планировщик задач (apscheduler)
+
+# Утилиты для работы с медиадиректорией
+BASE_DIR = Path(__file__).parent
+MEDIA_DIR = BASE_DIR / "media"
+MEDIA_ROOT = MEDIA_DIR / str(PROJECT_ID)
+MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+
+# Описание состояний FSM для режима пользователя и админа
 class FAQState(StatesGroup):
-    waiting_for_choice = State()
+    waiting_for_choice = State()  # Ожидание ввода номера вопроса пользователем
 
 class AdminStates(StatesGroup):
-    in_menu                = State()
-    adding_question        = State()
-    adding_answer          = State()
-    adding_media           = State()
-    deleting_selection     = State()
-    deleting_confirmation  = State()
+    in_menu               = State()  # Админ находится в главном меню
+    adding_question       = State()  # Ввод текста нового вопроса
+    adding_answer         = State()  # Ввод текста ответа на новый вопрос
+    adding_media          = State()  # Ожидание прикрепления медиа-файла или ответа "нет"
+    deleting_selection    = State()  # Ожидание ввода номера FAQ для удаления
+    deleting_confirmation = State()  # Ожидание подтверждения удаления FAQ
 
-# — Утилиты для текста и меню —
-def format_questions(entries):
+# Утилиты для работы с данными FAQ
+def get_entries():
+    """Получить список всех FAQ-записей для текущего проекта."""
+    return get_faq_entries(PROJECT_ID) or []
+
+def add_entry(question: str, answer: str, media: str = ""):
+    """Добавить FAQ-запись в базу и вернуть её ID."""
+    return add_faq_entry(PROJECT_ID, question, answer, media)
+
+def delete_entry(entry_id: int):
+    """Удалить FAQ-запись из базы по ID."""
+    return delete_faq_entry(PROJECT_ID, entry_id)
+
+def format_questions(entries: list[dict]) -> str:
+    """Сформировать текст списка вопросов для сообщения."""
     text = "📖 FAQ — Список вопросов:\n\n"
     for idx, e in enumerate(entries, start=1):
         text += f"{idx}. {e['question']}\n"
     return text
 
-def build_admin_menu():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("➕ Добавить FAQ", callback_data="admin_add_faq"),
-        types.InlineKeyboardButton("🗑 Удалить FAQ", callback_data="admin_del_faq")
-    )
-    return kb
+def build_admin_menu() -> types.InlineKeyboardMarkup:
+    """Построить инлайн-клавиатуру главного меню администратора."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Добавить FAQ", callback_data="admin_add_faq")
+    kb.button(text="🗑 Удалить FAQ", callback_data="admin_del_faq")
+    kb.adjust(2)
+    return kb.as_markup()
 
-# === /help и /adminhelp ===
+from aiogram import Router
+admin_router = Router()
+user_router = Router()
 
-@dp.message_handler(commands=['help'])
-async def user_help(msg: types.Message):
-    await msg.answer(
-        "ℹ️ Введите /faq или нажмите кнопку «Список вопросов», "
-        "чтобы увидеть возможные вопросы и получить ответ."
-    )
-
-@dp.message_handler(commands=['adminhelp'])
-async def admin_help(msg: types.Message):
-    if msg.chat.id != ADMIN_CHAT:
-        return
-    await msg.answer(
-        "🛠 Админ-меню FAQ:\n"
-        "— ➕ Добавить FAQ: добавить новый вопрос/ответ/медиа\n"
-        "— 🗑 Удалить FAQ: удалить существующий вопрос\n\n"
-        "Нажмите любую кнопку, чтобы открыть меню."
-    )
-
-# === Фоллбек ===
-
-@dp.message_handler(state="*")
-async def fallback(msg: types.Message):
+@dp.message(Command('start'))
+async def cmd_start(msg: types.Message, state: FSMContext):
+    """Обработка команды /start."""
+    # Сброс предыдущего состояния при старте
+    await state.clear()
     if msg.chat.id == ADMIN_CHAT:
-        await msg.answer("🛠 Главное меню FAQ:", reply_markup=build_admin_menu())
+        # Приветствие для администратора
+        await msg.answer(
+            "👋 Бот запущен. Вы являетесь администратором.\n"
+            "Используйте меню ниже для управления FAQ:",
+            reply_markup=build_admin_menu()
+        )
+        # Устанавливаем состояние меню админа
+        await state.set_state(AdminStates.in_menu)
     else:
-        await msg.answer("❓ Нажмите /faq или кнопку «Список вопросов».")
+        # Приветствие для обычного пользователя
+        await msg.answer(
+            "👋 Добро пожаловать! Этот бот поможет вам получить ответы на часто задаваемые вопросы.\n"
+            "Нажмите /list или кнопку «Список вопросов», чтобы увидеть все вопросы."
+        )
 
-# === Админ-меню через кнопки ===
+@dp.message(Command("chatid"))
+async def cmd_chatid(m: types.Message):
+    await m.answer(f"Chat ID: `{m.chat.id}`", parse_mode="Markdown")
 
-@dp.message_handler(lambda m: m.chat.id==ADMIN_CHAT, content_types=types.ContentTypes.TEXT)
-async def show_admin_menu(msg: types.Message):
+@dp.message(Command('help'))
+async def cmd_help(msg: types.Message):
+    """Обработка команды /help."""
+    if msg.chat.id == ADMIN_CHAT:
+        # Справка для администратора
+        await msg.answer(
+            "🛠 <b>Администрирование FAQ</b>:\n"
+            "Команды:\n"
+            "/add – добавить новый вопрос и ответ (с медиа)\n"
+            "/delete – удалить вопрос из FAQ\n"
+            "/list – просмотреть список FAQ (как видит пользователь)\n\n"
+            "Вы также можете использовать меню кнопок ниже."
+        )
+        # Показываем меню админа после помощи
+        await msg.answer("🛠 Главное меню FAQ:", reply_markup=build_admin_menu())
+        await AdminStates.in_menu.set()
+    else:
+        # Справка для пользователя
+        await msg.answer(
+            "ℹ️ <b>Как получить ответ?</b>\n"
+            "Отправьте команду /list или нажмите кнопку «Список вопросов», чтобы увидеть перечень FAQ.\n"
+            "Затем введите номер вопроса, чтобы получить ответ."
+        )
+
+@user_router.message(Command('list'), lambda m: m.chat.id != ADMIN_CHAT)
+async def cmd_list(message: types.Message, state: FSMContext):
+    """Обработка команды /list – показать список FAQ пользователю."""
+    entries = get_entries()
+    if not entries:
+        await message.answer("❌ В FAQ пока нет записей.")
+        return
+    # Отправляем список вопросов с кнопкой обновления
+    text = format_questions(entries)
+
+    await message.answer(text)
+    # Переводим пользователя в состояние ожидания выбора вопроса
+    await state.set_state(FAQState.waiting_for_choice)
+
+@user_router.callback_query(lambda c: c.data == "faq_list")
+async def user_refresh_list(
+    c: types.CallbackQuery,
+    state: FSMContext
+):
+    entries = get_entries()
+    if not entries:
+        return await c.answer("❌ FAQ пуст.", show_alert=True)
+
+    # Сформировать и отправить (редактировать) список вопросов
+    text = format_questions(entries)
+
+    await c.message.edit_text(text)
+    await c.answer()  # убрать «часики»
+
+    # Снова выставляем состояние ожидания выбора вопроса,
+    # чтобы кнопку можно было нажимать бесконечно
+    await state.set_state(FAQState.waiting_for_choice)
+
+@user_router.message(StateFilter(FAQState.waiting_for_choice), lambda m: m.chat.id != ADMIN_CHAT)
+async def user_select_question(message: types.Message, state: FSMContext):
+    """Обработка ответа пользователя (номер выбранного вопроса)."""
+    user_input = message.text.strip()
+    # Пользователь может ввести слово "список" вместо нажатия кнопки
+    if user_input.lower() in ["список", "список вопросов"]:
+        entries = get_entries()
+        if not entries:
+            await message.answer("❌ FAQ пуст.")
+            return
+        text = format_questions(entries)
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔄 Список вопросов", callback_data="faq_list")
+        kb.adjust(1)
+        await message.answer(text, reply_markup=kb.as_markup())
+        # Оставляем состояние тем же (продолжаем ждать выбора)
+        return
+
+    if not user_input.isdigit():
+        await message.answer("❗ Пожалуйста, введите номер вопроса.")
+        return
+    idx = int(user_input)
+    entries = get_entries()
+    if idx < 1 or idx > len(entries):
+        await message.answer("❗ Неверный номер вопроса.")
+        return
+    entry = entries[idx - 1]
+    # Отправляем ответ на вопрос (с медиа, если приложено)
+    if entry['media']:
+        file_path = MEDIA_ROOT / entry['media']
+        if file_path.exists():
+            try:
+                ext = file_path.suffix.lower()
+                if ext in [".jpg", ".jpeg", ".png", ".gif"]:
+                    # Изображение или GIF
+                    if ext == ".gif":
+                        await message.answer_animation(FSInputFile(file_path), caption=entry['answer'])
+                    else:
+                        await message.answer_photo(FSInputFile(file_path), caption=entry['answer'])
+                elif ext == ".mp4":
+                    await message.answer_video(FSInputFile(file_path), caption=entry['answer'])
+                elif ext == ".mp3":
+                    await message.answer_audio(FSInputFile(file_path), caption=entry['answer'])
+                else:
+                    # Прочие файлы отправляем как документ
+                    await message.answer_document(FSInputFile(file_path), caption=entry['answer'])
+            except Exception as e:
+                # Если возникла ошибка при отправке медиа, отправим только текст ответа
+                await message.answer(entry['answer'])
+        else:
+            await message.answer(entry['answer'])
+    else:
+        await message.answer(entry['answer'])
+    # После ответа предлагаем снова посмотреть список вопросов
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔄 Список вопросов", callback_data="faq_list")
+    kb.adjust(1)
+    await message.answer("ℹ️ Вы можете снова посмотреть список вопросов:", reply_markup=kb.as_markup())
+    # Завершаем состояние (возвращаемся к начальному)
+    await state.clear()
+
+@admin_router.message(Command('add'), lambda m: m.chat.id == ADMIN_CHAT)
+async def cmd_add(msg: types.Message, state: FSMContext):
+    """Обработка команды /add – начать добавление нового FAQ."""
+    # Только для админа: запускаем FSM для добавления
+    await state.set_state(AdminStates.adding_question)
+    await msg.answer("➕ Введите текст <b>вопроса</b>:")
+@admin_router.message(Command('delete'), lambda m: m.chat.id == ADMIN_CHAT)
+async def cmd_delete(msg: types.Message, state: FSMContext):
+    """Обработка команды /delete – начать удаление FAQ."""
+    entries = get_entries()
+    if not entries:
+        await msg.answer("❌ FAQ пуст.", reply_markup=build_admin_menu())
+        # Остаемся в меню
+        await state.set_state(AdminStates.in_menu)
+        return
+    # Выводим список вопросов для выбора
+    text = format_questions(entries) + "\n\nВведите номер вопроса для удаления:"
+    await msg.answer(text)
+    await state.set_state(AdminStates.deleting_selection)
+
+@admin_router.message(lambda m: m.chat.id == ADMIN_CHAT, StateFilter(None))
+async def show_admin_menu(msg: types.Message, state: FSMContext):
+    """Показать главное меню администрирования (кнопки) – для админа вне состояния."""
     await msg.answer("🛠 Главное меню FAQ:", reply_markup=build_admin_menu())
-    await AdminStates.in_menu.set()
+    await state.set_state(AdminStates.in_menu)
 
-@dp.callback_query_handler(lambda c: c.data=="admin_cancel", state="*")
-async def admin_cancel(c: types.CallbackQuery, state: FSMContext):
-    await state.finish()
-    await c.message.edit_text("❎ Операция отменена.\n\n🛠 Главное меню FAQ:", reply_markup=build_admin_menu())
+@admin_router.callback_query(lambda c: c.data == "admin_add_faq")
+async def admin_add_start(c: types.CallbackQuery, state: FSMContext):
+    # Проверка прав администратора
+    if  c.message.chat.id != ADMIN_CHAT:
+        return await c.answer("❌ Нет доступа", show_alert=True)
+
+    await c.message.edit_text("➕ Введите текст <b>вопроса</b>:")
+    await state.set_state(AdminStates.adding_question)
     await c.answer()
 
-# === Добавление FAQ ===
+# Кнопка «🗑 Удалить FAQ» — тоже без фильтра по состоянию
+@admin_router.callback_query(lambda c: c.data == "admin_del_faq")
+async def admin_del_start(c: types.CallbackQuery, state: FSMContext):
+    if c.message.chat.id != ADMIN_CHAT:
+        return await c.answer("❌ Нет доступа", show_alert=True)
 
-@dp.callback_query_handler(lambda c: c.data=="admin_add_faq", state=AdminStates.in_menu)
-async def admin_add_start(c: types.CallbackQuery):
-    await c.message.edit_text("➕ Введите текст **вопроса**:")
-    await AdminStates.adding_question.set()
-    await c.answer()
-
-@dp.message_handler(state=AdminStates.adding_question, lambda m: m.chat.id==ADMIN_CHAT)
-async def admin_add_q(msg: types.Message, state: FSMContext):
-    await state.update_data(question=msg.text.strip())
-    await msg.answer("✏️ Введите текст **ответа**:")
-    await AdminStates.adding_answer.set()
-
-@dp.message_handler(state=AdminStates.adding_answer, lambda m: m.chat.id==ADMIN_CHAT)
-async def admin_add_a(msg: types.Message, state: FSMContext):
-    await state.update_data(answer=msg.text.strip())
-    await msg.answer("📷 Прикрепите медиа-файл или введите «нет»:")
-    await AdminStates.adding_media.set()
-
-@dp.message_handler(
-    state=AdminStates.adding_media,
-    lambda m: m.chat.id==ADMIN_CHAT,
-    content_types=types.ContentTypes.ANY
-)
-async def admin_add_m(msg: types.Message, state: FSMContext):
-    data = await state.get_data()
-    media = ""
-    if msg.content_type == 'photo':
-        file_id = msg.photo[-1].file_id
-        file_obj = await bot.get_file(file_id)
-        data_bytes = await bot.download_file(file_obj.file_path)
-        path = save_media_file(
-            project_id=PROJECT_ID,
-            file_bytes=data_bytes,
-            original_filename=f"{file_id}.jpg",
-            media_root=Path(__file__).parent.parent / "media"
-        )
-        media = path.name
-    elif msg.content_type == 'document':
-        file_id = msg.document.file_id
-        file_obj = await bot.get_file(file_id)
-        data_bytes = await bot.download_file(file_obj.file_path)
-        path = save_media_file(
-            project_id=PROJECT_ID,
-            file_bytes=data_bytes,
-            original_filename=msg.document.file_name,
-            media_root=Path(__file__).parent.parent / "media"
-        )
-        media = path.name
-    elif msg.text.strip().lower() != 'нет':
-        await msg.answer("❗ Ожидался файл или «нет». Отмена.")
-        return await state.finish()
-
-    eid = add_entry(data['question'], data['answer'], media)
-    await msg.answer(f"✅ FAQ #{eid} добавлен.", reply_markup=build_admin_menu())
-    await state.finish()
-
-# === Удаление FAQ ===
-
-@dp.callback_query_handler(lambda c: c.data=="admin_del_faq", state=AdminStates.in_menu)
-async def admin_del_list(c: types.CallbackQuery):
     entries = get_entries()
     if not entries:
         await c.message.edit_text("❌ FAQ пуст.", reply_markup=build_admin_menu())
         return await c.answer()
-    text = format_questions(entries) + "\n\nВведите номер для удаления:"
+    text = format_questions(entries) + "\n\nВведите номер вопроса для удаления:"
     await c.message.edit_text(text)
-    await AdminStates.deleting_selection.set()
+    await state.set_state(AdminStates.deleting_selection)
     await c.answer()
+@admin_router.message(StateFilter(AdminStates.adding_question), lambda m: m.chat.id == ADMIN_CHAT)
+async def admin_add_question(msg: types.Message, state: FSMContext):
+    """Шаг 1 – получен текст нового вопроса от админа."""
+    question_text = msg.text.strip()
+    if not question_text:
+        await msg.answer("❗ Вопрос не должен быть пустым. Попробуйте снова.")
+        return
+    await state.update_data(question=question_text)
+    await msg.answer("✏️ Введите текст <b>ответа</b>:")
+    await state.set_state(AdminStates.adding_answer)
 
-@dp.message_handler(state=AdminStates.deleting_selection, lambda m: m.chat.id==ADMIN_CHAT)
-async def admin_del_select(msg: types.Message, state: FSMContext):
+@admin_router.message(StateFilter(AdminStates.adding_answer), lambda m: m.chat.id == ADMIN_CHAT)
+async def admin_add_answer(msg: types.Message, state: FSMContext):
+    """Шаг 2 – получен текст ответа на вопрос."""
+    answer_text = msg.text.strip()
+    if not answer_text:
+        await msg.answer("❗ Ответ не должен быть пустым. Попробуйте снова.")
+        return
+    await state.update_data(answer=answer_text)
+    await msg.answer("📷 Прикрепите медиа-файл с ответом или отправьте 'нет', если медиа не требуется.")
+    await state.set_state(AdminStates.adding_media)
+
+@admin_router.message(StateFilter(AdminStates.adding_media), lambda m: m.chat.id == ADMIN_CHAT)
+async def admin_add_media(msg: types.Message, state: FSMContext):
+    """Шаг 3 – получение медиа-файла (или 'нет')."""
+    data = await state.get_data()
+    media_filename = ""
+    # Если прикреплено фото
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+        file_obj = await bot.get_file(file_id)
+        file_bytes = await bot.download_file(file_obj.file_path)
+        saved_path = save_media_file(project_id=PROJECT_ID, file_bytes=file_bytes,
+                                     original_filename=f"{file_id}.jpg", media_root=MEDIA_DIR)
+        media_filename = saved_path.name
+    # Если документ (любое вложение файла)
+    elif msg.document:
+        file_id = msg.document.file_id
+        file_obj = await bot.get_file(file_id)
+        file_bytes = await bot.download_file(file_obj.file_path)
+        original_name = msg.document.file_name or f"{file_id}"
+        saved_path = save_media_file(project_id=PROJECT_ID, file_bytes=file_bytes,
+                                     original_filename=original_name, media_root=MEDIA_DIR)
+        media_filename = saved_path.name
+    # Если видео
+    elif msg.video:
+        file_id = msg.video.file_id
+        file_obj = await bot.get_file(file_id)
+        file_bytes = await bot.download_file(file_obj.file_path)
+        original_name = msg.video.file_name or f"{file_id}.mp4"
+        saved_path = save_media_file(project_id=PROJECT_ID, file_bytes=file_bytes,
+                                     original_filename=original_name, media_root=MEDIA_DIR)
+        media_filename = saved_path.name
+    # Если аудио
+    elif msg.audio:
+        file_id = msg.audio.file_id
+        file_obj = await bot.get_file(file_id)
+        file_bytes = await bot.download_file(file_obj.file_path)
+        original_name = msg.audio.file_name or f"{file_id}.mp3"
+        saved_path = save_media_file(project_id=PROJECT_ID, file_bytes=file_bytes,
+                                     original_filename=original_name, media_root=MEDIA_DIR)
+        media_filename = saved_path.name
+    # Если анимация (GIF)
+    elif msg.animation:
+        file_id = msg.animation.file_id
+        file_obj = await bot.get_file(file_id)
+        file_bytes = await bot.download_file(file_obj.file_path)
+        original_name = msg.animation.file_name or f"{file_id}.gif"
+        saved_path = save_media_file(project_id=PROJECT_ID, file_bytes=file_bytes,
+                                     original_filename=original_name, media_root=MEDIA_DIR)
+        media_filename = saved_path.name
+    # Если админ ответил текстом "нет"
+    elif msg.text and msg.text.strip().lower() == "нет":
+        media_filename = ""
+    else:
+        # Любой другой тип сообщения (стикер, локация и т.п.) или неправильный ввод
+        await msg.answer("❗ Ожидался медиа-файл или 'нет'. Добавление отменено.", reply_markup=build_admin_menu())
+        await state.clear()
+        return
+
+    # Сохраняем новую запись FAQ в базу
+    question_text = data.get('question')
+    answer_text = data.get('answer')
+    new_id = add_entry(question_text, answer_text, media_filename)
+    if new_id:
+        await msg.answer(f"✅ FAQ #{new_id} добавлен.", reply_markup=build_admin_menu())
+    else:
+        await msg.answer("⚠️ Не удалось добавить запись FAQ. Попробуйте позже.", reply_markup=build_admin_menu())
+    # Завершаем FSM-состояние
+    await state.clear()
+@admin_router.message(StateFilter(AdminStates.deleting_selection), lambda m: m.chat.id == ADMIN_CHAT)
+async def admin_delete_select(msg: types.Message, state: FSMContext):
+    """Шаг 1 удаления: получили номер вопроса для удаления от админа."""
     if not msg.text.isdigit():
-        return await msg.answer("❗ Введите номер вопроса для удаления.")
+        await msg.answer("❗ Введите <b>номер</b> вопроса цифрой.")
+        return
     idx = int(msg.text.strip())
     entries = get_entries()
-    if idx<1 or idx>len(entries):
-        return await msg.answer("❗ Неверный номер.")
-    e = entries[idx-1]
-    await state.update_data(del_id=e['id'])
-    kb = types.InlineKeyboardMarkup().add(
-        types.InlineKeyboardButton("✅ Да", callback_data="del_confirm"),
-        types.InlineKeyboardButton("❌ Нет", callback_data="del_cancel")
-    )
-    await msg.answer(f"Удалить FAQ #{e['id']} «{e['question']}»?", reply_markup=kb)
-    await AdminStates.deleting_confirmation.set()
+    if idx < 1 or idx > len(entries):
+        await msg.answer("❗ Неверный номер. Попробуйте снова.")
+        return
+    # Получаем запись FAQ по индексу
+    entry = entries[idx - 1]
+    # Сохраняем ID (и имя медиа) удаляемой записи в состоянии, чтобы использовать при подтверждении
+    await state.update_data(del_id=entry['id'], del_media=entry['media'])
+    # Спрашиваем подтверждение
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Да", callback_data="del_confirm")
+    kb.button(text="❌ Нет", callback_data="del_cancel")
+    kb.adjust(2)
+    await msg.answer(f"Вы уверены, что хотите удалить FAQ #{entry['id']} \"{entry['question']}\"?", reply_markup=kb.as_markup())
+    await state.set_state(AdminStates.deleting_confirmation)
 
-@dp.callback_query_handler(
-    lambda c: c.data in ['del_confirm','del_cancel'],
-    state=AdminStates.deleting_confirmation
-)
-async def admin_del_confirm(c: types.CallbackQuery, state: FSMContext):
-    if c.data=='del_confirm':
-        eid = (await state.get_data())['del_id']
-        delete_entry(eid)
-        await c.message.edit_text(f"✅ FAQ #{eid} удалён.", reply_markup=build_admin_menu())
+@admin_router.callback_query(StateFilter(AdminStates.deleting_confirmation), lambda c: c.data in ["del_confirm", "del_cancel"])
+async def admin_delete_confirm(c: types.CallbackQuery, state: FSMContext):
+    """Шаг 2 удаления: подтверждение или отмена."""
+    data = await state.get_data()
+    if c.data == 'del_confirm':
+        entry_id = data.get('del_id')
+        media_name = data.get('del_media') or ""
+        # Удаляем запись из базы
+        delete_entry(entry_id)
+        # Если у FAQ было прикреплено медиа – удаляем и файл с диска
+        if media_name:
+            file_path = MEDIA_ROOT / media_name
+            delete_media_file(file_path)
+        await c.message.edit_text(f"✅ FAQ #{entry_id} удалён.", reply_markup=build_admin_menu())
     else:
+        # Отмена удаления
         await c.message.edit_text("❌ Удаление отменено.", reply_markup=build_admin_menu())
-    await state.finish()
+    await state.clear()
     await c.answer()
-
-# === Пользовательский режим ===
-
-@dp.message_handler(lambda m: m.chat.id != ADMIN_CHAT, commands=['faq'])
-async def cmd_faq(message: types.Message):
-    entries = get_entries()
-    if not entries:
-        return await message.answer("❌ В FAQ пока нет записей.")
-    text = format_questions(entries)
-    kb = types.InlineKeyboardMarkup().add(
-        types.InlineKeyboardButton("🔄 Список вопросов", callback_data="faq_list")
-    )
-    await message.answer(text, reply_markup=kb)
-    await FAQState.waiting_for_choice.set()
-
-@dp.callback_query_handler(lambda c: c.data=="faq_list", state="*")
-async def faq_list(c: types.CallbackQuery):
-    entries = get_entries()
-    if not entries:
-        return await c.answer("❌ FAQ пуст.", show_alert=True)
-    text = format_questions(entries)
-    kb = types.InlineKeyboardMarkup().add(
-        types.InlineKeyboardButton("🔄 Список вопросов", callback_data="faq_list")
-    )
-    await c.message.edit_text(text, reply_markup=kb)
-    await c.answer()
-
-@dp.message_handler(lambda m: m.chat.id != ADMIN_CHAT, state=FAQState.waiting_for_choice)
-async def process_choice(message: types.Message, state: FSMContext):
-    text = message.text.strip()
-    if text.lower() in ['список','список вопросов']:
-        return await faq_list(types.CallbackQuery(
-            id=None, from_user=message.from_user, data="faq_list", message=message))
-    if not text.isdigit():
-        return await message.answer("❗ Введите номер вопроса.")
-    idx = int(text)
-    entries = get_entries()
-    if idx<1 or idx>len(entries):
-        return await message.answer("❗ Неверный номер.")
-    e = entries[idx-1]
-    if e['media']:
-        path = Path(__file__).parent.parent / "media" / str(PROJECT_ID) / e['media']
-        if path.exists():
-            await bot.send_photo(message.chat.id, open(path,'rb'), caption=e['answer'])
-        else:
-            await message.answer(e['answer'])
+@dp.message(StateFilter(None),~Command("start", "help", "list", "add", "delete"))
+async def fallback(msg: types.Message, state: FSMContext):
+    """Фоллбек: обработка любых не распознанных сообщений."""
+    if msg.chat.id == ADMIN_CHAT:
+        # Для администратора: показать меню при непонятном сообщении
+        await msg.answer("🛠 Главное меню FAQ:", reply_markup=build_admin_menu())
+        await state.set_state(AdminStates.in_menu)
     else:
-        await message.answer(e['answer'])
-    kb = types.InlineKeyboardMarkup().add(
-        types.InlineKeyboardButton("🔄 Список вопросов", callback_data="faq_list")
-    )
-    await message.answer("Чтобы увидеть заново, нажмите кнопку.", reply_markup=kb)
-    await state.finish()
+        # Для пользователя: подсказка воспользоваться /list
+        await msg.answer("❓ Используйте команду /list или кнопку «Список вопросов», чтобы увидеть вопросы.")
+# Включаем наши routers в диспетчер
+dp.include_router(admin_router)
+dp.include_router(user_router)
 
-if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True)
-{% endraw %}
+@dp.startup()
+async def on_startup():
+    # запуск планировщика (если добавлены задачи)
+    scheduler.start()
+
+async def setup_bot_commands(bot: Bot):
+    # Команды, отображаемые всем пользователям (в личных чатах)
+    user_commands = [
+        BotCommand(command="start", description="Начать работу с ботом"),
+        BotCommand(command="help", description="Помощь по боту"),
+        BotCommand(command="list", description="Список вопросов")
+    ]
+    # Расширенный список команд для администратора
+    admin_commands = [
+        BotCommand(command="start", description="Начать работу с ботом"),
+        BotCommand(command="help", description="Помощь по боту"),
+        BotCommand(command="list", description="Список вопросов"),
+        BotCommand(command="add", description="Добавить FAQ-вопрос"),
+        BotCommand(command="delete", description="Удалить FAQ-вопрос")
+    ]
+    # Устанавливаем команды для всех приватных чатов (обычные пользователи)
+    await bot.set_my_commands(user_commands, scope=BotCommandScopeAllPrivateChats())
+    # Отдельно – для админского чата (чтобы админ видел команды /add, /delete)
+    try:
+        await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_CHAT))
+    except Exception as e:
+        logging.warning(f"Не удалось зарегистрировать команды для ADMIN_CHAT: {e}")
+

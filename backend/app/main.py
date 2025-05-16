@@ -6,7 +6,7 @@ from jinja2 import Environment, FileSystemLoader
 from pathlib import Path
 from zipfile import ZipFile
 from typing import List
-
+from app.seeders import apply_seed
 from app.database      import init_db, create_project, get_projects, DB_PATH
 from app.export_utils  import build_single_project_db
 from app.schemas       import ProjectCreate
@@ -17,7 +17,7 @@ import os
 import json
 
 # вместо "from utils import order_db" и пр.:
-from app.utils         import order_db as dbё
+from app.utils         import order_db as db
 from app.utils.collage import generate_collage
 
 # --- какие utils нужны какому боту ---------------------------------
@@ -58,7 +58,7 @@ app = FastAPI()
 # CORS для фронтенда
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:5173","http://172.20.10.3:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -74,15 +74,22 @@ def root():
 @app.post("/projects")
 async def create_new_project(project: str = Form(...)):
     """
-    Ожидает JSON-представление проекта в поле Form 'project'.
+    Ожидает JSON-строку проекта в multipart-form поле `project`.
     """
     try:
         data = json.loads(project)
         bot_project = ProjectCreate(**data)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Ошибка парсинга проекта: {e}")
+        raise HTTPException(status_code=400,
+                            detail=f"Ошибка парсинга проекта: {e}")
 
+    # 1) создаём запись и получаем ID
     project_id = create_project(bot_project)
+
+    # 2) если seed передан — применяем его
+    if bot_project.seed is not None:
+        apply_seed(project_id, bot_project.seed)
+
     return {"status": "created", "project_id": project_id}
 
 @app.post("/projects/{project_id}/media")
@@ -180,39 +187,37 @@ def export_bot(project_id: int):
     run_py = export_dir / "run.py"
     run_py.write_text(
         "\n".join([
-            "#!/usr/bin/env python3",
-            "import logging",
-            "import os",
-            "import asyncio",
-            "from dotenv import load_dotenv",
-            "",
-            "# 1) Логирование",
-            "logging.basicConfig(",
-            "    level    = logging.INFO,",
-            "    format   = \"%Y-%m-%d %H:%M:%S [%(levelname)s] %(name)s: %(message)s\"",
-            ")",
-            "logging.getLogger(\"aiogram\").setLevel(logging.DEBUG)",
-            "",
-            "# 2) Импорт бота из сгенерированного модуля",
-            f"from {template_type} import bot, dp, setup_bot_commands",
-            "",
-            "async def main():",
-            "    load_dotenv()",
-            "    # регистрируем команды у бота",
-            "    await setup_bot_commands(bot)",
-            "    # и стартуем polling",
-            "    await dp.start_polling(bot, skip_updates=True)",
-            "",
-            "if __name__ == '__main__':",
-            "    asyncio.run(main())",
-        ]),
+    "#!/usr/bin/env python3",
+    "import logging",
+    "import asyncio",
+    "from dotenv import load_dotenv",
+    "",
+    f"from {template_type} import bot, dp, setup_bot_commands",
+    "",
+    "# 1) Логирование — формат даты через datefmt",
+    'logging.basicConfig(',
+    '    level=logging.INFO,',
+    '    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",',
+    '    datefmt="%Y-%m-%d %H:%M:%S"',
+    ')',
+    'logging.getLogger("aiogram").setLevel(logging.DEBUG)',
+    "",
+    "async def main():",
+    "    load_dotenv()",
+    "    await setup_bot_commands(bot)",
+    "    await dp.start_polling(bot, skip_updates=True)",
+    "",
+    "if __name__ == '__main__':",
+    "    asyncio.run(main())",
+]
+),
         encoding="utf-8"
     )
 
     # 6) Копируем медиа
     media_src = BASE_DIR / "media" / str(project_id)
     if media_src.exists():
-        shutil.copytree(media_src, export_dir / "media")
+        shutil.copytree(media_src, export_dir / "media"/ str(project_id))
 
     # 7) Генерируем Windows-скрипты
     # 7.1) start_bot.bat

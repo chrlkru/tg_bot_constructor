@@ -11,32 +11,32 @@ cur.execute("PRAGMA foreign_keys = ON")
 
 # Создание таблицы FAQ
 cur.execute("""
-CREATE TABLE IF NOT EXISTS faq (
+CREATE TABLE IF NOT EXISTS faq_entries (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id INTEGER,
     question   TEXT,
     answer     TEXT,
-    media      TEXT
+    media_path TEXT
 )""")
 conn.commit()
 
-def safe_execute(query: str, params: tuple = ()):
+def safe_execute(query: str, params: tuple = ()):  # pragma: no cover
     """Безопасно выполнить SQL-запрос и вернуть результат или None."""
     try:
         cur.execute(query, params)
-        if query.strip().upper().startswith("SELECT"):
+        sql = query.strip().upper()
+        if sql.startswith("SELECT"):
             return cur.fetchall()
-        else:
-            conn.commit()
-            if query.strip().upper().startswith("INSERT"):
-                return cur.lastrowid
-            else:
-                return cur.rowcount
+        conn.commit()
+        if sql.startswith("INSERT"):
+            return cur.lastrowid
+        return cur.rowcount
     except Exception as e:
         print(f"Database error: {e}")
         return None
 
-def transaction(func):
+
+def transaction(func):  # pragma: no cover
     """Декоратор для выполнения серии SQL-запросов транзакционно."""
     def wrapper(*args, **kwargs):
         try:
@@ -50,18 +50,36 @@ def transaction(func):
             return None
     return wrapper
 
-def get_faq_entries(project_id: int):
-    """Вернуть список всех FAQ-записей для проекта."""
-    res = safe_execute("SELECT * FROM faq WHERE project_id=?", (project_id,))
-    return res if res is not None else []
 
-def add_faq_entry(project_id: int, question: str, answer: str, media: str = ""):
+def get_faq_entries(project_id: int) -> list[dict]:
+    with _conn() as db:
+        cur = db.execute(
+            "SELECT id, question, answer, media_path FROM faq_entries WHERE project_id = ? ORDER BY id",
+            (project_id,)
+        )
+        return [
+            {
+                "id": row["id"],
+                "question": row["question"],
+                "answer": row["answer"],
+                "media": row["media_path"] or ""
+            }
+            for row in cur.fetchall()
+        ]
+
+
+
+def add_faq_entry(project_id: int, question: str, answer: str, media_path: str = ""):
     """Добавить новый FAQ; вернуть его ID."""
     return safe_execute(
-        "INSERT INTO faq(project_id, question, answer, media) VALUES (?, ?, ?, ?)",
-        (project_id, question, answer, media)
+        "INSERT INTO faq_entries(project_id, question, answer, media_path) VALUES (?, ?, ?, ?)",
+        (project_id, question, answer, media_path)
     )
+
 
 def delete_faq_entry(project_id: int, entry_id: int):
     """Удалить FAQ-запись по ее ID."""
-    return safe_execute("DELETE FROM faq WHERE project_id=? AND id=?", (project_id, entry_id))
+    return safe_execute(
+        "DELETE FROM faq_entries WHERE project_id = ? AND id = ?",
+        (project_id, entry_id)
+    )

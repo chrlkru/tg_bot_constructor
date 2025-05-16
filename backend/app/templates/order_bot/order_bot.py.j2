@@ -7,12 +7,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+from utils.media import save_media_file
 import logging
 import os
 import tempfile
 from pathlib import Path
 from html import escape
-
+from utils.collage import generate_collage
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
@@ -35,23 +36,10 @@ if not BOT_TOKEN:
 PROJECT_ID = {{ project_id }}
 ADMIN_CHAT = {{ admin_chat_id }}
 
-
 # ──────────────────────── подключаем БД-модуль ───────────────────────
 # utils/order_dp.py должен лежать рядом с utils/order_bot.db
-from utils import order_dp as db          # ← новый import
-
+from utils import order_db as db          # ← новый import
 db.init_db()
-
-# при первой установке добавляем демонстрационный товар
-if not db.get_products_list(PROJECT_ID):
-    db.add_product(
-        PROJECT_ID,
-        "Тестовый товар",
-        "Краткое описание, 100 ₽",
-        "Полное описание тестового товара.",
-        "sample.jpg"                      # положите картинку media/<project_id>/sample.jpg
-    )
-
 # ────────────────────────── инициализация ─────────────────────────────
 bot = Bot(token=BOT_TOKEN,
           default=DefaultBotProperties(parse_mode="HTML"))
@@ -59,74 +47,87 @@ dp  = Dispatcher(storage=MemoryStorage())
 
 MEDIA_ROOT = Path(__file__).resolve().parent / "media" / str(PROJECT_ID)
 
-# ──────────────────────── состояния FSM ───────────────────────────────
+# ─── Определение состояний FSM ────────────────────────────────────────────────
 class CatalogState(StatesGroup):
-    page = State()
+    page = State()  # текущее отображаемое меню страницы каталога
 
 class CartState(StatesGroup):
-    checkout_address = State()
-    checkout_confirm = State()
+    checkout_address = State()   # ожидание ввода адреса
+    checkout_media   = State()   # ожидание медиа-файла или отказа
+    checkout_confirm = State()   # ожидание подтверждения заказа
 
 class ProductAdminState(StatesGroup):
-    name        = State()
-    short_desc  = State()
-    full_desc   = State()
-    waiting_img = State()
+    name        = State()  # ввод названия товара
+    short_desc  = State()  # ввод краткого описания
+    full_desc   = State()  # ввод полного описания
+    waiting_img = State()  # ожидание изображения товара
 
 class DeleteProductState(StatesGroup):
-    selecting_page    = State()
-    confirming_delete = State()
+    selecting_page    = State()  # выбор страницы каталога для удаления
+    confirming_delete = State()  # подтверждение удаления товара
 
-# ───────────────────────── вспомогательные ────────────────────────────
-from utils.collage import generate_collage
-from utils.media   import save_media_file
+# ─── Команды /debug и /chatid (для отладки) ───────────────────────────────────
 
-# ───────────────────────────── handlers ───────────────────────────────
 @dp.message(Command("chatid"))
-async def cmd_chatid(m: types.Message):
-    await m.answer(f"Этот чат имеет ID: `{m.chat.id}`", parse_mode="Markdown")
+async def cmd_chatid(msg: types.Message):
+    """Отправляет ID текущего чата (для помощи в получении ADMIN_CHAT_ID)."""
+    await msg.answer(f"Этот чат имеет ID: `{msg.chat.id}`", parse_mode="Markdown")
 
-# ---------- каталог ----------
+# ─── Каталог товаров ─────────────────────────────────────────────────────────
 @dp.message(Command("start", "catalog"))
-async def cmd_catalog(m: types.Message, state: FSMContext):
-    if db.is_banned(PROJECT_ID, m.from_user.id):
-        return await m.answer("❌ Вы заблокированы.")
+async def cmd_catalog(message: types.Message, state: FSMContext):
+
+    """Обрабатывает команду /start или /catalog – показывает первую страницу каталога."""
+    # Проверяем, не заблокирован ли пользователь
+    if db.is_banned(PROJECT_ID, message.from_user.id):
+        return await message.answer("❌ Вы заблокированы.")
+    # Устанавливаем номер страницы каталога на 1 и отправляем первую страницу
     await state.update_data(page=1)
-    await send_catalog_page(m.chat.id, state)
+    await send_catalog_page(message.chat.id, state)
 
 @dp.callback_query(lambda c: c.data in {"prev", "next"}, StateFilter(CatalogState.page))
-async def catalog_nav(cq: types.CallbackQuery, state: FSMContext):
-    data  = await state.get_data()
-    page  = data.get("page", 1)
-    items = db.get_products_list(PROJECT_ID)
-    if cq.data == "prev" and page > 1:
+async def catalog_nav(cb: types.CallbackQuery, state: FSMContext):
+    """Листает страницы каталога (назад/вперед) по нажатиям inline-кнопок."""
+    data = await state.get_data()
+    page = data.get("page", 1)
+    products = db.get_products_list(PROJECT_ID)
+
+    # Изменяем номер страницы в зависимости от нажатой кнопки
+    if cb.data == "prev" and page > 1:
         page -= 1
-    if cq.data == "next" and page*9 < len(items):
+    elif cb.data == "next" and page * 9 < len(products):
         page += 1
+
     await state.update_data(page=page)
-    await send_catalog_page(cq.message.chat.id, state)
-    await cq.answer()
+    await send_catalog_page(cb.message.chat.id, state)
+    await cb.answer()  # убираем "часики" на кнопке
 
 async def send_catalog_page(chat_id: int, state: FSMContext):
-    page   = (await state.get_data()).get("page", 1)
-    items  = db.get_products_list(PROJECT_ID)
-    slice_ = items[(page-1)*9 : page*9]
+    """Отправляет изображение-коллаж с текущей страницей каталога и кнопки навигации."""
+    page = (await state.get_data()).get("page", 1)
+    products = db.get_products_list(PROJECT_ID)
+    # Получаем срез товаров для данной страницы (по 9 на страницу)
+    slice_ = products[(page - 1) * 9 : page * 9]
 
-    collage_tmp = Path(tempfile.gettempdir()) / f"catalog_{page}.jpg"
-    generate_collage([str(MEDIA_ROOT/p['media']) for p in slice_ if p['media']], collage_tmp)
+    # Генерируем коллаж из изображений товаров текущей страницы во временный файл
+    collage_path = Path(tempfile.gettempdir()) / f"catalog_{page}.jpg"
+    generate_collage([str(MEDIA_ROOT / p["media"]) for p in slice_ if p["media"]], collage_path)
 
+    # Создаём inline-клавиатуру: кнопки с номерами товаров и стрелки навигации
     kb = InlineKeyboardBuilder()
-    for idx in range(1, len(slice_)+1):
+    for idx in range(1, len(slice_) + 1):
         kb.button(text=str(idx), callback_data=f"sel_{idx}")
-    if page > 1:            kb.button("◀️", callback_data="prev")
-    if page*9 < len(items): kb.button("▶️", callback_data="next")
-    kb.adjust(3)
+    if page > 1:
+        kb.button(text="◀️", callback_data="prev")
+    if page * 9 < len(products):
+        kb.button(text="▶️", callback_data="next")
+    kb.adjust(3)  # расположение: номера товаров по 3 в ряд, навигация на новой строке
 
-    await bot.send_photo(chat_id, FSInputFile(collage_tmp),
-                         caption=f"Страница {page}", reply_markup=kb.as_markup())
+    # Отправляем фотографию-коллаж с подписью и inline-кнопками
+    await bot.send_photo(chat_id, FSInputFile(collage_path), caption=f"Страница {page}", reply_markup=kb.as_markup())
+    # Устанавливаем состояние FSM каталога (находится на странице каталога)
     await state.set_state(CatalogState.page)
 
-# (остальная логика: выбор товара, корзина, заказ, админ-панель, …)
 @dp.callback_query(lambda c: c.data.startswith("sel_"), StateFilter(CatalogState.page))
 async def on_select_product(cb: types.CallbackQuery, state: FSMContext):
     idx = int(cb.data.split("_")[1]) - 1
@@ -499,28 +500,50 @@ async def adm_delete_cancel(cb: types.CallbackQuery, state: FSMContext):
     """Отмена удаления товара."""
     await cb.message.edit_caption("❌ Удаление отменено.", reply_markup=None)
     await state.clear()
+# ─── Регистрация команд бота ────────────────────────────────────────────────
+# планировщик, чтобы потом можно было добавлять задачи в Admin-панели
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+scheduler = AsyncIOScheduler()
+@dp.startup()
+async def on_startup():
+    scheduler.start()
 
-
-# --- регистрация команд ---
-async def setup_bot_commands(b: Bot):
-    default = [BotCommand("start", "Показать каталог товаров")]
-    await b.set_my_commands(default, scope=BotCommandScopeDefault())
-    await b.set_my_commands(default, scope=BotCommandScopeAllPrivateChats())
-    await b.set_my_commands(default, scope=BotCommandScopeAllGroupChats())
-
-    admin_extra = [
-        BotCommand("addproduct", "Добавить товар"),
-        BotCommand("delproduct", "Удалить товар"),
-        BotCommand("ban",        "Бан пользователя"),
-        BotCommand("unban",      "Разбан пользователя"),
+# ─── Регистрация команд бота ────────────────────────────────────────────────
+async def setup_bot_commands(bot: Bot):
+    # 1) Общие команды (видны везде, если нет более узкого scope)
+    default_cmds = [
+        BotCommand(command="start",      description="Показать каталог товаров"),
     ]
-    await b.set_my_commands(default+admin_extra,
-                            scope=BotCommandScopeChat(chat_id=ADMIN_CHAT))
+    await bot.set_my_commands(
+        default_cmds,
+        scope=BotCommandScopeDefault(),
+        language_code="ru"
+    )
 
-# ──────────────────────────── запуск ───────────────────────────────────
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    async def _startup():
-        await setup_bot_commands(bot)
-    dp.run_polling(bot, skip_updates=True, startup=[_startup])
+    # 2) Личные чаты — дублируем
+    await bot.set_my_commands(
+        default_cmds,
+        scope=BotCommandScopeAllPrivateChats(),
+        language_code="ru"
+    )
+
+    # 3) Все групповые чаты — тоже дублируем
+    await bot.set_my_commands(
+        default_cmds,
+        scope=BotCommandScopeAllGroupChats(),
+        language_code="ru"
+    )
+
+    # 4) Админ-группа — объединяем обычные и админские команды
+    admin_cmds = [
+        BotCommand(command="addproduct", description="Добавить товар (админ)"),
+        BotCommand(command="delproduct", description="Удалить товар (админ)"),
+        BotCommand(command="ban",        description="Заблокировать пользователя"),
+        BotCommand(command="unban",      description="Разблокировать пользователя"),
+    ]
+    await bot.set_my_commands(
+        default_cmds + admin_cmds,
+        scope=BotCommandScopeChat(chat_id=ADMIN_CHAT),
+        language_code="ru"
+    )
+

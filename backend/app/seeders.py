@@ -7,7 +7,8 @@ app/seeders.py
 
 import json
 from typing import Any
-
+from app.utils.media import save_media_file, MEDIA_ROOT
+from app.utils.order_db import add_product
 # --- Pydantic-модели сидов --------------------------------------------
 from app.schemas import (
     SeedUnion,
@@ -41,8 +42,14 @@ from app.utils.moderation import toggle_setting as mod_toggle_setting, whitelist
 # 1) Order-bot: товары ---------------------------------------------------
 def seed_order_bot(pid: int, seed: OrderBotSeed) -> None:
     for item in seed.products:
-        add_product(pid, item.name, item.short_descr,
-                    item.full_descr or "", item.photo_file or "")
+        add_product(
+            pid,
+            item.name,
+            item.short_descr,
+            item.full_descr,
+            item.photo_file or ""   # уже оригинальное имя
+        )
+
 
 
 # 2) FAQ-bot: вопросы-ответы ---------------------------------------------
