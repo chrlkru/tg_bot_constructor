@@ -130,7 +130,9 @@ def init_db(db_path: Path = None):
             project_id INTEGER,
             alias TEXT UNIQUE,
             content TEXT,
-            media_path TEXT
+            media_path TEXT,
+            admin_only BOOLEAN DEFAULT 0
+)
         )
         """)
         # Moderator-bot: настройки

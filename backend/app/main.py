@@ -11,7 +11,12 @@ from app.database      import init_db, create_project, get_projects, DB_PATH
 from app.export_utils  import build_single_project_db
 from app.schemas       import ProjectCreate
 from app.utils.media   import save_media_file, list_media_files
+import logging
+import traceback
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
+logger = logging.getLogger("uvicorn.error")
 import shutil
 import os
 import json
@@ -53,12 +58,13 @@ BOT_UTILS = {
 
 BASE_DIR = Path(__file__).resolve().parent
 
-app = FastAPI()
+app = FastAPI(debug=False)
+
 
 # CORS для фронтенда
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173","http://172.20.10.3:5173"],
+    allow_origins=["http://localhost:5173","http://172.20.10.3:5173","http://localhost:8000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -66,7 +72,16 @@ app.add_middleware(
 
 # инициализируем основную БД конструктора
 init_db()
-
+@app.exception_handler(Exception)
+async def all_exception_handler(request: Request, exc: Exception):
+    # Логируем полный traceback
+    tb = traceback.format_exc()
+    logger.error(f"Unhandled error at {request.url}:\n{tb}")
+    # Отдаём клиенту JSON с сообщением (можно убрать текст исключения в проде)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal Server Error", "error": str(exc)}
+    )
 @app.get("/")
 def root():
     return {"message": "Сервер конструктора Telegram-ботов запущен"}

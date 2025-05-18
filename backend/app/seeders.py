@@ -34,7 +34,7 @@ from app.database import (
 )
 
 # --- Утилиты ------------------------------------------------------------
-from app.utils.helper import add_helper_entry
+from app.utils.helper_db import add_helper_entry
 from app.utils.feedback import log_feedback, block_user as fb_block_user
 from app.utils.moderation import toggle_setting as mod_toggle_setting, whitelist_add
 
