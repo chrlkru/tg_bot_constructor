@@ -45,7 +45,7 @@ def save_media_file(
     dest_dir = media_root / str(project_id)
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    # если имя занято — аккуратно делаем уникальное
+
     final_name = _resolve_collision(dest_dir, original_filename)
     dest_file = dest_dir / final_name
     dest_file.write_bytes(file_bytes)

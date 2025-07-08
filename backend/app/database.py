@@ -1,5 +1,5 @@
 # app/database.py
-
+import logging
 import sqlite3
 import json
 import os
@@ -47,21 +47,7 @@ def init_db(db_path: Path = None):
             media_path TEXT
         )
         """)
-        # Бронирования
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS bookings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id INTEGER,
-            user_id INTEGER,
-            service_id INTEGER,
-            start_dt TEXT,
-            duration_cells INTEGER,
-            client_name TEXT,
-            client_phone TEXT,
-            status TEXT DEFAULT 'pending',
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-        """)
+
         # Бан-лист
         cur.execute("""
         CREATE TABLE IF NOT EXISTS banned_users (
@@ -80,23 +66,69 @@ def init_db(db_path: Path = None):
             quantity INTEGER DEFAULT 1
         )
         """)
-        # Окна работы
+        # ────────── CRM: услуги ──────────
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS work_intervals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        CREATE TABLE IF NOT EXISTS services (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
             project_id INTEGER,
-            start_dt TEXT,
-            end_dt TEXT
+            name       TEXT,
+            price      TEXT,
+            duration   INTEGER,
+            category   TEXT
         )
         """)
-        # Исключения (паника)
+        # ────────── CRM: расписание ──────────
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS work_intervals (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER,
+            date       TEXT,
+            time       TEXT,
+            UNIQUE(project_id, date, time)
+        )
+        """)
+        # ────────── CRM: исключения ──────────
         cur.execute("""
         CREATE TABLE IF NOT EXISTS work_exceptions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
             project_id INTEGER,
-            start_dt TEXT,
-            end_dt TEXT,
-            state TEXT
+            start      TEXT,
+            end        TEXT
+        )
+        """)
+        # ────────── CRM: брони ──────────
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS bookings (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER,
+            user_id    INTEGER,
+            service_id INTEGER,
+            slot_id    INTEGER,
+            date       TEXT,
+            time       TEXT,
+            details    TEXT,
+            UNIQUE(project_id, slot_id),
+            FOREIGN KEY(slot_id) REFERENCES work_intervals(id)
+        )
+        """)
+        # ────────── CRM: клиенты ──────────
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS clients (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER,
+            user_id    INTEGER,
+            name       TEXT,
+            phone      TEXT,
+            UNIQUE(project_id, user_id)
+        )
+        """)
+        # ────────── CRM: настройки ──────────
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            project_id INTEGER,
+            key        TEXT,
+            value      TEXT,
+            PRIMARY KEY(project_id, key)
         )
         """)
         # Настройки рассылки
@@ -126,13 +158,13 @@ def init_db(db_path: Path = None):
         # Helper-bot: «пасты»
         cur.execute("""
         CREATE TABLE IF NOT EXISTS helper_entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id INTEGER,
-            alias TEXT UNIQUE,
-            content TEXT,
-            media_path TEXT,
-            admin_only BOOLEAN DEFAULT 0
-)
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id   INTEGER,
+            alias        TEXT,
+            content      TEXT,
+            media_path   TEXT,
+            admin_only   BOOLEAN    DEFAULT 0,
+            UNIQUE(project_id, alias)
         )
         """)
         # Moderator-bot: настройки
@@ -314,6 +346,88 @@ def update_booking_status(booking_id, status):
             (status, booking_id)
         )
 
+# ────────── Smart-Booking: минимальный CRUD ────────────────────────────
+# ⚠️  Все функции используют ту же DB_PATH и transaction, что и остальной код.
+
+def crm_add_service(project_id: int,
+                    name: str,
+                    price: str | int | float,
+                    duration_cells: int,
+                    category: str = "Общее") -> int:
+    """Создаёт услугу и возвращает её ID (price храним как TEXT)."""
+    with transaction(DB_PATH) as conn:
+        cur = conn.execute(
+            """INSERT INTO services(project_id, name, price, duration, category)
+               VALUES (?,?,?,?,?)""",
+            (project_id, name, str(price), duration_cells, category)
+        )
+        return cur.lastrowid
+
+
+def crm_add_slot(project_id: int, date_iso: str, time_hm: str) -> int:
+    """
+    Добавляет 15-минутный слот; возвращает
+    1 – если создан, 0 – если уже существовал (UNIQUE).
+    """
+    with transaction(DB_PATH) as conn:
+        try:
+            conn.execute(
+                "INSERT INTO work_intervals(project_id, date, time) VALUES (?,?,?)",
+                (project_id, date_iso, time_hm)
+            )
+            return 1
+        except sqlite3.IntegrityError:
+            return 0
+
+
+def crm_create_booking_safe(project_id: int,
+                            user_id: int,
+                            service_id: int,
+                            slot_id: int,
+                            details: str = "") -> int | None:
+    """
+    Безопасно бронирует слот (если он свободен).
+    Возвращает ID брони или None, когда слот уже занят/отсутствует.
+    """
+    with transaction(DB_PATH) as conn:
+        # Проверяем, свободен ли слот
+        busy = conn.execute(
+            "SELECT 1 FROM bookings WHERE project_id=? AND slot_id=?",
+            (project_id, slot_id)
+        ).fetchone()
+        if busy:
+            return None
+
+        # Берём дату/время из work_intervals
+        row = conn.execute(
+            "SELECT date, time FROM work_intervals WHERE id=?",
+            (slot_id,)
+        ).fetchone()
+        if not row:
+            return None
+
+        date_iso, time_hm = row
+        cur = conn.execute(
+            "INSERT INTO bookings(project_id, user_id, service_id, slot_id, date, time, details) "
+                "VALUES(?,?,?,?,?,?,?)",
+
+            (project_id, user_id, service_id, slot_id,
+             date_iso, time_hm, details)
+        )
+        return cur.lastrowid
+
+
+def crm_set_project_setting(project_id: int, key: str, value: str) -> None:
+    """Upsert в таблицу settings, привязанную к проекту."""
+    with transaction(DB_PATH) as conn:
+        conn.execute(
+            """INSERT INTO settings(project_id,key,value)
+               VALUES (?,?,?)
+               ON CONFLICT(project_id,key)
+               DO UPDATE SET value=excluded.value""",
+            (project_id, key, value)
+        )
+
 def get_bookings_by_date(project_id, date_str, status="confirmed"):
     rows = safe_execute(
         "SELECT id,user_id,service_id,start_dt,duration_cells,client_name,client_phone "
@@ -424,6 +538,28 @@ def cancel_bookings_in_interval(project_id, start_iso, end_iso):
             {"id": r[0], "user_id": r[1], "service_id": r[2], "start_dt": r[3]}
             for r in rows
         ]
+# Создаём отдельное соединение и курсор для CRM-seeder’а
+_crm_conn = sqlite3.connect(DB_PATH)
+_crm_conn.row_factory = sqlite3.Row
+_crm_cur  = _crm_conn.cursor()
+
+def crm_safe_execute(query: str, params: tuple = ()):
+    """
+    Как в booking_db.safe_execute:
+    - для SELECT возвращает список sqlite3.Row
+    - для INSERT/UPDATE/DELETE возвращает .rowcount
+    - при ошибке возвращает None и логирует
+    """
+    try:
+        _crm_cur.execute(query, params)
+        sql = query.strip().upper()
+        if sql.startswith("SELECT"):
+            return _crm_cur.fetchall()
+        _crm_conn.commit()
+        return _crm_cur.rowcount
+    except Exception as e:
+        logging.error(f"CRM safe_execute error: {e}")
+        return None
 
 def get_setting(key):
     rows = safe_execute(

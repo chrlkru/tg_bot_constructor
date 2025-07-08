@@ -7,10 +7,23 @@ from pathlib import Path
 from app.database import init_db, DB_PATH
 
 PROJECT_TABLES = [
-    "projects", "products", "faq_entries", "cart_items", "bookings",
-    "work_intervals", "helper_entries",
-    "moderation_settings", "link_whitelist",
-    "quiz_questions"
+    "projects",
+    "products",
+    "faq_entries",
+    "cart_items",
+    "bookings",
+    "work_intervals",
+    # --- CRM-specific ---
+    "services",
+    "clients",
+    "work_exceptions",
+    "settings",
+    # --- shared admin/helper ---
+    "helper_entries",
+    "moderation_settings",
+    "link_whitelist",
+    # --- quiz bot ---
+    "quiz_questions",
 ]
 
 def build_single_project_db(project_id: int) -> Path:

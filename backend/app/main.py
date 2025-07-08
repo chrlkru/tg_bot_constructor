@@ -1,4 +1,6 @@
 # backend/app/main.py
+import pdb
+
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -69,9 +71,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+from app.utils.booking_db import init_db as init_crm_db
 # инициализируем основную БД конструктора
 init_db()
+
 @app.exception_handler(Exception)
 async def all_exception_handler(request: Request, exc: Exception):
     # Логируем полный traceback
@@ -100,12 +103,14 @@ async def create_new_project(project: str = Form(...)):
 
     # 1) создаём запись и получаем ID
     project_id = create_project(bot_project)
-
+    seeded = False
     # 2) если seed передан — применяем его
     if bot_project.seed is not None:
         apply_seed(project_id, bot_project.seed)
-
-    return {"status": "created", "project_id": project_id}
+        seeded = True
+    return {"status": "created",
+        "project_id": project_id,
+        "seed_applied": seeded}
 
 @app.post("/projects/{project_id}/media")
 async def upload_media(
